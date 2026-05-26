@@ -11,6 +11,9 @@
     "url": "https://github.com/vrwarp/charproof/issues"
   },
   "homepage": "https://github.com/vrwarp/charproof#readme",
+  "files": [
+    "dist"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
