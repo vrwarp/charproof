@@ -3,6 +3,14 @@
   "version": "1.0.1",
   "description": "Zero-knowledge encryption and identity management library for LetUsMeet, built for Cloud Firestore.",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vrwarp/charproof.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vrwarp/charproof/issues"
+  },
+  "homepage": "https://github.com/vrwarp/charproof#readme",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
