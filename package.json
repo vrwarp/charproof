@@ -1,0 +1,35 @@
+{
+  "name": "charproof",
+  "version": "1.0.0",
+  "description": "Zero-knowledge encryption and identity management library for LetUsMeet, built for Cloud Firestore.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "example": "tsx examples/demo.ts"
+  },
+  "dependencies": {
+    "bip39": "^3.1.0"
+  },
+  "peerDependencies": {
+    "firebase": "^12.12.1"
+  },
+  "devDependencies": {
+    "@xstate/test": "^0.5.1",
+    "fake-indexeddb": "^6.2.5",
+    "fast-check": "^4.8.0",
+    "tsx": "^4.22.3",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.7",
+    "xstate": "^4.38.3"
+  }
+}
