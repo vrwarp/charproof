@@ -1,6 +1,6 @@
 {
   "name": "charproof",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Zero-knowledge encryption and identity management library for LetUsMeet, built for Cloud Firestore.",
   "type": "module",
   "main": "./dist/index.js",
