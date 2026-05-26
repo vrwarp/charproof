@@ -49,7 +49,7 @@ jobs:
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
-          # Caching disabled for release builds
+          package-manager-cache: false # never use caching in release builds
 
       - name: Install Dependencies
         run: npm ci
@@ -63,7 +63,8 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Bump Version
-        run: npm version patch -m "chore: bump version to %s [skip ci]"
+        run: |
+          npm version patch -m "chore: bump version to %s [skip ci]"
 
       - name: Push Version Bump
         run: git push origin main --follow-tags
