@@ -1,5 +1,7 @@
 # Charproof
 
+[![npm version](https://img.shields.io/npm/v/charproof.svg)](https://www.npmjs.com/package/charproof)
+
 Charproof is a standalone zero-knowledge encryption and identity management library built for Cloud Firestore. It is designed to secure application data on the client side before saving to the database, supporting multiple authorized devices and secure recovery keys via WebAuthn PRF.
 
 ## Features
@@ -11,8 +13,10 @@ Charproof is a standalone zero-knowledge encryption and identity management libr
 
 ## Installation
 
+Install from the NPM registry:
+
 ```bash
-npm install
+npm install charproof
 ```
 
 ## Scripts
