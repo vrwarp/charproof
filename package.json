@@ -1,6 +1,6 @@
 {
   "name": "charproof",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Standalone zero-knowledge encryption, device management, and secure identity library built for Cloud Firestore.",
   "type": "module",
   "repository": {
