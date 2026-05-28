@@ -36,7 +36,7 @@ export class FirestoreAccountKeyStore implements AccountKeyStore {
     
     while (true) {
       try {
-        const snap = await getDoc(ref);
+        const snap = await withRetry(() => getDoc(ref));
         if (!snap.exists()) return null;
         return snap.data() as AccountKeysDocument;
       } catch (e: any) {
@@ -80,7 +80,7 @@ export class FirestoreAccountKeyStore implements AccountKeyStore {
   async getKeystoreEntry(ledgerId: string): Promise<KeystoreEntry | null> {
     const uid = this.getUid();
     const ref = doc(getDb(), "users", uid, "keystore", ledgerId);
-    const snap = await getDoc(ref);
+    const snap = await withRetry(() => getDoc(ref));
     if (!snap.exists()) return null;
     return snap.data() as KeystoreEntry;
   }
@@ -100,7 +100,7 @@ export class FirestoreAccountKeyStore implements AccountKeyStore {
   async getPendingDevice(deviceId: string): Promise<PendingDevice | null> {
     const uid = this.getUid();
     const ref = doc(getDb(), "users", uid, "pending_devices", deviceId);
-    const snap = await getDoc(ref);
+    const snap = await withRetry(() => getDoc(ref));
     if (!snap.exists()) return null;
     return snap.data() as PendingDevice;
   }

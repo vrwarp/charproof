@@ -729,7 +729,7 @@ export function subscribeToUserKeystore(
       // Fallback: update with the original entries if the entire mapping fails
       onUpdate(entries);
     }
-  });
+  }, onError);
 }
 
 export async function rejectDeviceRequest(deviceId: string): Promise<void> {

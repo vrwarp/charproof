@@ -51,10 +51,18 @@ export class FirestoreLedgerEventStore implements LedgerEventStore {
     try {
       // 2. Fetch the current chaff pool
       const poolSnap = await getDoc(doc(db, "chaff_pool", "current"));
+      let activePolls: string[] = [];
 
       if (poolSnap.exists()) {
-        const activePolls: string[] = poolSnap.data().activePollIds || [];
-        
+        activePolls = poolSnap.data().activePollIds || [];
+        try {
+          localStorage.setItem("charproof_chaff_pool", JSON.stringify(activePolls));
+        } catch (e) {
+          // Safe fallback for private browsing or full storage
+        }
+      }
+
+      if (activePolls.length > 0) {
         // Exclude our own ledgerId to avoid writing self-chaff
         const candidates = activePolls.filter(id => id !== ledgerId);
         
@@ -80,8 +88,33 @@ export class FirestoreLedgerEventStore implements LedgerEventStore {
         }
       }
     } catch (err) {
-      // Silent catch: network failures fetching chaff must NEVER block user voting.
-      console.warn("Failed to fetch chaff pool. Proceeding with single write.", err);
+      // Try local storage fallback before giving up on chaff generation
+      console.warn("Failed to fetch chaff pool from network. Attempting local storage cache fallback...", err);
+      try {
+        const cachedPoolStr = localStorage.getItem("charproof_chaff_pool");
+        if (cachedPoolStr) {
+          const cachedPolls: string[] = JSON.parse(cachedPoolStr) || [];
+          const candidates = cachedPolls.filter(id => id !== ledgerId);
+          const selectedChaffIds = candidates
+            .sort(() => 0.5 - Math.random())
+            .slice(0, X);
+
+          for (const chaffId of selectedChaffIds) {
+            const decoyEventId = generateId();
+            const decoyRef = doc(db, "polls", chaffId, "events", decoyEventId);
+            const decoyPayload = generateRealisticDecoy(data.encryptedData.length, data.iv.length);
+            
+            batch.set(decoyRef, {
+              eventId: decoyEventId,
+              createdAt: serverTimestamp(),
+              encryptedData: decoyPayload.encryptedData,
+              iv: decoyPayload.iv
+            });
+          }
+        }
+      } catch (cacheErr) {
+        console.error("Local chaff pool cache fallback failed:", cacheErr);
+      }
     }
 
     // 4. Commit all writes simultaneously in a single network request (with retry)
@@ -117,7 +150,7 @@ export class FirestoreLedgerEventStore implements LedgerEventStore {
   async getGenesisEvent(ledgerId: string): Promise<{ encryptedData: string; iv: string } | null> {
     const eventsRef = collection(getDb(), "polls", ledgerId, "events");
     const q = query(eventsRef, orderBy("createdAt", "asc"), limit(1));
-    const snapshot = await getDocs(q);
+    const snapshot = await withRetry(() => getDocs(q));
     if (snapshot.empty) return null;
     const data = snapshot.docs[0].data();
     return {
