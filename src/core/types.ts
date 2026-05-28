@@ -227,9 +227,10 @@ export interface LedgerSession {
   /**
    * Subscribes to real-time decrypted updates of the ledger events.
    * @param onUpdate Callback triggered with all decrypted, verified events.
+   * @param onError Optional callback triggered when the underlying listener encounters a fatal error (e.g. network loss, permission change).
    * @returns Unsubscribe function to stop listening.
    */
-  subscribe(onUpdate: (events: DecryptedLedgerEvent[]) => void): () => void;
+  subscribe(onUpdate: (events: DecryptedLedgerEvent[]) => void, onError?: (error: Error) => void): () => void;
 
   /**
    * Retrieves the very first event in the ledger (Genesis).

@@ -99,7 +99,11 @@ export async function getActiveAmk(): Promise<{ amk: AesGcmKey, amkId: string }>
   verificationPromise = (async () => {
     try {
       const user = auth.getCurrentUser();
-      if (!user || user.isAnonymous) throw new Error("Must be signed in to access AMK.");
+      if (!user || user.isAnonymous) {
+        const err = new Error("Must be signed in to access AMK.");
+        (err as any).retryable = false;
+        throw err;
+      }
 
       const deviceId = getDeviceId();
       const accountKeys = await store.getAccountKeys();
@@ -128,9 +132,13 @@ export async function getActiveAmk(): Promise<{ amk: AesGcmKey, amkId: string }>
         }
 
         if (!wrappedAmkBase64) {
-          throw new Error("UNRECOGNIZED_DEVICE: This browser instance has not been authorized to access your encrypted data.");
+          const err = new Error("UNRECOGNIZED_DEVICE: This browser instance has not been authorized to access your encrypted data.");
+          (err as any).retryable = false;
+          throw err;
         }
-        throw new Error("IDENTITY_MISMATCH: The passkey used does not match the one registered for this device.");
+        const err = new Error("IDENTITY_MISMATCH: The passkey used does not match the one registered for this device.");
+        (err as any).retryable = false;
+        throw err;
       }
 
       const amkBuffer = await unwrapAmkById(accountKeys, deviceId, deviceKeys.privateKey, amkId);
@@ -141,6 +149,13 @@ export async function getActiveAmk(): Promise<{ amk: AesGcmKey, amkId: string }>
       opportunisticallyEnableRecovery().catch(e => console.warn("Opportunistic recovery check failed:", e));
 
       return { amk: cachedAmk, amkId: cachedAmkId };
+    } catch (e: any) {
+      // Annotate network errors as retryable if not already set
+      if (e.retryable === undefined) {
+        const code = e.code || '';
+        (e as any).retryable = ['unavailable', 'deadline-exceeded', 'resource-exhausted', 'aborted'].includes(code);
+      }
+      throw e;
     } finally {
       verificationPromise = null;
     }
@@ -266,7 +281,9 @@ export async function registerCurrentDevice(amk: AesGcmKey, amkId: string): Prom
   const deviceKeyPair = await generateDeviceKeyPair();
   const privB64 = await exportDevicePrivateKey(deviceKeyPair.privateKey);
   const pubB64 = await exportDevicePublicKey(deviceKeyPair.publicKey);
-  await local.saveDeviceKeys({ privateKey: privB64, publicKey: pubB64 });
+
+  // C3 FIX: Do NOT save keys to IndexedDB yet — defer until after Firestore confirms.
+  // This prevents permanent lockout if the Firestore write fails.
 
   const deviceId = getDeviceId();
   const currentDoc = await store.getAccountKeys();
@@ -281,17 +298,31 @@ export async function registerCurrentDevice(amk: AesGcmKey, amkId: string): Prom
     currentDoc
   );
 
+  // Commit to Firestore first — if this throws, local keys remain unchanged.
   await store.setAccountKeys(updatedDoc);
+
+  // Only persist the new keys locally after the remote write succeeds.
+  await local.saveDeviceKeys({ privateKey: privB64, publicKey: pubB64 });
 
   cachedAmk = amk;
   cachedAmkId = amkId;
 }
 
 async function setupGenesisDevice(uid: string): Promise<{ amk: AesGcmKey, amkId: string }> {
-  const deviceKeyPair = await generateDeviceKeyPair();
-  const privB64 = await exportDevicePrivateKey(deviceKeyPair.privateKey);
-  const pubB64 = await exportDevicePublicKey(deviceKeyPair.publicKey);
-  await local.saveDeviceKeys({ privateKey: privB64, publicKey: pubB64 });
+  // C2 FIX: Reuse existing local device keys if present (idempotent genesis).
+  // Prevents credential mismatch if a previous genesis attempt saved keys to IDB
+  // but failed before committing to Firestore.
+  let privB64: string;
+  let pubB64: string;
+  const existingKeys = await local.loadDeviceKeys();
+  if (existingKeys) {
+    privB64 = existingKeys.privateKey;
+    pubB64 = existingKeys.publicKey;
+  } else {
+    const deviceKeyPair = await generateDeviceKeyPair();
+    privB64 = await exportDevicePrivateKey(deviceKeyPair.privateKey);
+    pubB64 = await exportDevicePublicKey(deviceKeyPair.publicKey);
+  }
 
   const deviceId = getDeviceId();
   const { masterKey: prfKey } = await derivePrfMasterKey();
@@ -308,7 +339,11 @@ async function setupGenesisDevice(uid: string): Promise<{ amk: AesGcmKey, amkId:
     prfMethodId
   );
 
+  // Commit to Firestore first
   await store.setAccountKeys(doc);
+
+  // Only persist device keys after Firestore succeeds (safe for both fresh + retry)
+  await local.saveDeviceKeys({ privateKey: privB64, publicKey: pubB64 });
 
   const amk = await getCrypto().importSymmetricKey(new Uint8Array(rawAmk) as RawKeyBytes);
 
@@ -331,6 +366,14 @@ export async function enablePrfRecovery(): Promise<void> {
   const wrappedForPrf = btoa(JSON.stringify({ ciphertext: prfCipher, iv: prfIv }));
 
   await store.transactAccountKeys(async (current) => {
+    // M4 FIX: TOCTOU guard — verify the AMK hasn't been rotated since we read it.
+    // If it has, our wrappedForPrf contains the wrong AMK and we must abort.
+    if (current.activeAmkId !== amkId) {
+      throw new Error(
+        `[charproof] AMK rotated during enablePrfRecovery (expected ${amkId}, got ${current.activeAmkId}). ` +
+        `Aborting to prevent sealing the wrong key version. Retry to use the current AMK.`
+      );
+    }
     const encryptedRecLabel = await encryptPayload(amk, `Passkey on ${getDeviceName()}`);
     current.recoveryMethods[prfMethodId] = {
       type: 'prf',
@@ -367,11 +410,18 @@ export async function revokeDevice(revokedDeviceId: string) {
     );
   });
 
-  const rawNewAmk = await exportSymmetricKey(newAmk);
-  const amkBuffer = base64UrlToUint8(rawNewAmk);
-
-  cachedAmk = await getCrypto().importSymmetricKey(new Uint8Array(amkBuffer.buffer as ArrayBuffer) as RawKeyBytes);
-  cachedAmkId = newAmkId;
+  // H3 FIX: Wrap post-transaction cache update in try/catch.
+  // If this fails, clear the cache so the next getActiveAmk() call can self-heal
+  // by re-deriving the AMK from the already-rotated Firestore document.
+  try {
+    const rawNewAmk = await exportSymmetricKey(newAmk);
+    const amkBuffer = base64UrlToUint8(rawNewAmk);
+    cachedAmk = await getCrypto().importSymmetricKey(new Uint8Array(amkBuffer.buffer as ArrayBuffer) as RawKeyBytes);
+    cachedAmkId = newAmkId;
+  } catch (e) {
+    console.warn("[charproof] Post-rotation cache update failed. Clearing cache for self-healing.", e);
+    clearAmkSessionCache();
+  }
 }
 
 export async function saveToKeystore(ledgerId: string, payload: LedgerCredentials) {

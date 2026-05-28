@@ -13,6 +13,7 @@ import {
 } from "firebase/firestore";
 import { getDb } from "../config";
 import type { LedgerEventStore } from "../core/interfaces";
+import { withRetry } from "../core/retry";
 
 function generateId(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
@@ -83,27 +84,34 @@ export class FirestoreLedgerEventStore implements LedgerEventStore {
       console.warn("Failed to fetch chaff pool. Proceeding with single write.", err);
     }
 
-    // 4. Commit all writes simultaneously in a single network request
-    await batch.commit();
+    // 4. Commit all writes simultaneously in a single network request (with retry)
+    await withRetry(() => batch.commit());
   }
 
   subscribe(
     ledgerId: string,
-    onUpdate: (events: Array<{ encryptedData: string; iv: string; id: string }>) => void
+    onUpdate: (events: Array<{ encryptedData: string; iv: string; id: string }>) => void,
+    onError?: (error: Error) => void
   ): () => void {
     const eventsRef = collection(getDb(), "polls", ledgerId, "events");
     const q = query(eventsRef, orderBy("createdAt", "asc"));
-    return onSnapshot(q, (snapshot) => {
-      const events = snapshot.docs.map(docSnap => {
-        const data = docSnap.data();
-        return {
-          id: docSnap.id,
-          encryptedData: data.encryptedData,
-          iv: data.iv
-        };
-      });
-      onUpdate(events);
-    });
+    return onSnapshot(q,
+      (snapshot) => {
+        const events = snapshot.docs.map(docSnap => {
+          const data = docSnap.data();
+          return {
+            id: docSnap.id,
+            encryptedData: data.encryptedData,
+            iv: data.iv
+          };
+        });
+        onUpdate(events);
+      },
+      (error) => {
+        console.error("[charproof] Ledger event listener error:", error);
+        onError?.(error);
+      }
+    );
   }
 
   async getGenesisEvent(ledgerId: string): Promise<{ encryptedData: string; iv: string } | null> {
@@ -120,9 +128,9 @@ export class FirestoreLedgerEventStore implements LedgerEventStore {
 
   async createLedger(ledgerId: string): Promise<void> {
     const ref = doc(getDb(), "polls", ledgerId);
-    await setDoc(ref, { 
+    await withRetry(() => setDoc(ref, { 
       pollId: ledgerId,
       createdAt: serverTimestamp()
-    });
+    }));
   }
 }

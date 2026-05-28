@@ -7,6 +7,15 @@ export const STORE_DEVICE_KEYS = "device_keys";
 export async function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    // M5 FIX: Timeout to prevent indefinite hangs when another tab blocks the upgrade
+    const timeout = setTimeout(() => {
+      reject(new Error("[charproof] IndexedDB open timed out after 10s. Another tab may be blocking the upgrade."));
+    }, 10000);
+
+    request.onblocked = () => {
+      console.warn("[charproof] IndexedDB upgrade blocked by another tab. Close other tabs and retry.");
+    };
     
     request.onupgradeneeded = () => {
       const db = request.result;
@@ -21,7 +30,13 @@ export async function openDB(): Promise<IDBDatabase> {
       }
     };
     
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      clearTimeout(timeout);
+      resolve(request.result);
+    };
+    request.onerror = () => {
+      clearTimeout(timeout);
+      reject(request.error);
+    };
   });
 }

@@ -146,16 +146,16 @@ export interface AccountKeyStore {
   ): Promise<void>;
 
   /** Listens to live, real-time updates of pending device enrollment requests. */
-  subscribePendingDevices(onSnapshot: (devices: PendingDevice[]) => void): () => void;
+  subscribePendingDevices(onSnapshot: (devices: PendingDevice[]) => void, onError?: (error: Error) => void): () => void;
 
   /** Listens to live updates of a specific pending device request. */
-  subscribePendingDevice(deviceId: string, onSnapshot: (device: PendingDevice | null) => void): () => void;
+  subscribePendingDevice(deviceId: string, onSnapshot: (device: PendingDevice | null) => void, onError?: (error: Error) => void): () => void;
 
   /** Listens to real-time changes to the root account keys document. */
-  subscribeAccountKeys(onSnapshot: (doc: AccountKeysDocument | null) => void): () => void;
+  subscribeAccountKeys(onSnapshot: (doc: AccountKeysDocument | null) => void, onError?: (error: Error) => void): () => void;
 
   /** Listens to real-time changes of all user keystore entries. */
-  subscribeKeystore(onSnapshot: (entries: KeystoreEntry[]) => void): () => void;
+  subscribeKeystore(onSnapshot: (entries: KeystoreEntry[]) => void, onError?: (error: Error) => void): () => void;
 
   /** Deletes a registered pending device request. */
   deletePendingDevice(deviceId: string): Promise<void>;
@@ -174,7 +174,8 @@ export interface LedgerEventStore {
   /** Listens to real-time updates of all events in the ledger, maintaining strict write ordering. */
   subscribe(
     ledgerId: string,
-    onSnapshot: (events: Array<{ encryptedData: string; iv: string; id: string }>) => void
+    onSnapshot: (events: Array<{ encryptedData: string; iv: string; id: string }>) => void,
+    onError?: (error: Error) => void
   ): () => void;
 
   /** Retrieves the very first genesis event in the ledger. */

@@ -107,19 +107,23 @@ export class BrowserLocalDeviceStore implements LocalDeviceStore {
     tx.objectStore(STORE_DEVICE_KEYS).clear();
     tx.objectStore(STORE_MASTER_KEYS).clear();
     tx.objectStore(STORE_IDENTITIES).clear();
-    
-    localStorage.removeItem("deviceId");
-    localStorage.removeItem("deviceName");
-    
-    for (let i = localStorage.length - 1; i >= 0; i--) {
-      const key = localStorage.key(i);
-      if (key && key.startsWith("prf_cred_")) {
-        localStorage.removeItem(key);
-      }
-    }
 
     return new Promise((resolve, reject) => {
-      tx.oncomplete = () => resolve();
+      tx.oncomplete = () => {
+        // L3 FIX: Only clear localStorage after IndexedDB clears succeed
+        // to prevent inconsistent state on partial failure.
+        localStorage.removeItem("deviceId");
+        localStorage.removeItem("deviceName");
+
+        for (let i = localStorage.length - 1; i >= 0; i--) {
+          const key = localStorage.key(i);
+          if (key && key.startsWith("prf_cred_")) {
+            localStorage.removeItem(key);
+          }
+        }
+
+        resolve();
+      };
       tx.onerror = () => reject(tx.error);
     });
   }

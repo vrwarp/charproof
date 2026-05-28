@@ -81,25 +81,37 @@ export class DefaultLedgerSession implements LedgerSession {
     await eventStore.appendEvent(this.ledgerId, eventId, encrypted);
   }
 
-  subscribe(onUpdate: (events: DecryptedLedgerEvent[]) => void): () => void {
+  subscribe(
+    onUpdate: (events: DecryptedLedgerEvent[]) => void,
+    onError?: (error: Error) => void
+  ): () => void {
     return eventStore.subscribe(this.ledgerId, async (rawEvents) => {
       const events = await processLedgerEventSnapshot(rawEvents, this.symmetricKey);
       onUpdate(events);
-    });
+    }, onError);
   }
 
   async getGenesisEvent(): Promise<DecryptedLedgerEvent | null> {
-    for (let i = 0; i < 10; i++) {
-      const genesis = await eventStore.getGenesisEvent(this.ledgerId);
-      if (genesis) {
-        const decrypted = await decryptAndValidateEvent(
-          genesis.encryptedData,
-          genesis.iv,
-          this.symmetricKey
-        );
-        if (decrypted) return decrypted;
+    const maxAttempts = 10;
+    let delay = 200;
+    for (let i = 0; i < maxAttempts; i++) {
+      try {
+        const genesis = await eventStore.getGenesisEvent(this.ledgerId);
+        if (genesis) {
+          const decrypted = await decryptAndValidateEvent(
+            genesis.encryptedData,
+            genesis.iv,
+            this.symmetricKey
+          );
+          if (decrypted) return decrypted;
+        }
+      } catch (e: any) {
+        // On network errors, let the backoff handle it; on permanent errors, throw immediately
+        const isTransient = e.code === 'unavailable' || e.code === 'deadline-exceeded' || e.code === 'resource-exhausted';
+        if (!isTransient && i >= 2) throw e; // Give non-transient errors a couple tries for eventual consistency
       }
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, delay));
+      delay = Math.min(delay * 1.5, 2000); // Exponential backoff, capped at 2s
     }
     return null;
   }
@@ -194,34 +206,41 @@ export async function getLedgerSession(
 
   // 3. Ownership token recovery
   if (options?.ownershipToken && options?.shareableKey) {
+    let delay = 200;
     for (let i = 0; i < 10; i++) {
-      const genesis = await eventStore.getGenesisEvent(ledgerId);
-      if (genesis) {
-        const creds = await attemptRecoveryWithToken(
-          options.ownershipToken,
-          options.shareableKey,
-          genesis
-        );
-        if (creds) {
-          if (user && !user.isAnonymous) {
-            await saveToKeystore(ledgerId, creds);
-          } else {
-            await local.saveIdentity(ledgerId, {
-              privateKey: creds.signingPrivateKey,
-              publicKey: creds.signingPublicKey
-            });
-          }
-          return new DefaultLedgerSession(
-            ledgerId,
-            await importSymmetricKey(options.shareableKey),
-            await importPrivateKey(creds.signingPrivateKey),
-            await importPublicKey(creds.signingPublicKey),
+      try {
+        const genesis = await eventStore.getGenesisEvent(ledgerId);
+        if (genesis) {
+          const creds = await attemptRecoveryWithToken(
+            options.ownershipToken,
             options.shareableKey,
-            creds.signingPublicKey
+            genesis
           );
+          if (creds) {
+            if (user && !user.isAnonymous) {
+              await saveToKeystore(ledgerId, creds);
+            } else {
+              await local.saveIdentity(ledgerId, {
+                privateKey: creds.signingPrivateKey,
+                publicKey: creds.signingPublicKey
+              });
+            }
+            return new DefaultLedgerSession(
+              ledgerId,
+              await importSymmetricKey(options.shareableKey),
+              await importPrivateKey(creds.signingPrivateKey),
+              await importPublicKey(creds.signingPublicKey),
+              options.shareableKey,
+              creds.signingPublicKey
+            );
+          }
         }
+      } catch (e: any) {
+        const isTransient = e.code === 'unavailable' || e.code === 'deadline-exceeded' || e.code === 'resource-exhausted';
+        if (!isTransient && i >= 2) throw e;
       }
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, delay));
+      delay = Math.min(delay * 1.5, 2000);
     }
   }
 
