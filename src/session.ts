@@ -5,7 +5,6 @@ import {
   exportSymmetricKey,
   exportPrivateKey,
   exportPublicKey,
-  deriveKeyFromPassword,
   generateIdentityKeyPair
 } from "./core/crypto";
 import {
@@ -52,8 +51,34 @@ function generateId(): string {
   return Math.random().toString(36).substring(2, 15);
 }
 
+/**
+ * Configures the set of the user's OWN ledger IDs eligible to receive decoy
+ * (chaff) writes, hiding which ledger actually changed. Only the caller's own
+ * writable ledgers may be passed — decoys are never written cross-tenant.
+ * No-op if the active event store does not support decoys.
+ */
+export function setLedgerDecoyPool(ledgerIds: string[]): void {
+  const maybe = eventStore as { setDecoyPool?: (ids: string[]) => void };
+  if (typeof maybe.setDecoyPool === "function") {
+    maybe.setDecoyPool(ledgerIds);
+  }
+}
+
 export class DefaultLedgerSession implements LedgerSession {
   private pendingOwnerRecovery: EncryptedData | null;
+
+  /**
+   * Optional allowlist of base64 SPKI signer public keys permitted to author
+   * events on this ledger. When set, events whose embedded public key is not in
+   * the set are rejected during validation, preventing a participant who holds
+   * the shared symmetric key from impersonating another participant. When null,
+   * any well-signed event is accepted (single-writer / trust-all mode).
+   */
+  private authorizedSigners: Set<string> | null = null;
+
+  /** Per-session memoization of decrypted events keyed by id+iv to avoid
+   *  re-decrypting the entire ledger on every snapshot. */
+  private readonly eventCache: Map<string, DecryptedLedgerEvent | null> = new Map();
 
   constructor(
     private ledgerId: string,
@@ -65,6 +90,17 @@ export class DefaultLedgerSession implements LedgerSession {
     ownerRecovery: EncryptedData | null = null
   ) {
     this.pendingOwnerRecovery = ownerRecovery;
+  }
+
+  /**
+   * Restricts which signer public keys are accepted on this ledger. Pass the set
+   * of authorized participant public keys (e.g. derived from membership events).
+   * Production multi-writer ledgers SHOULD call this; see SECURITY.md.
+   */
+  setAuthorizedSigners(signers: Iterable<string> | null): void {
+    this.authorizedSigners = signers ? new Set(signers) : null;
+    // Membership changed: drop memoized validations so they are re-evaluated.
+    this.eventCache.clear();
   }
 
   async appendEvent(action: any): Promise<void> {
@@ -86,8 +122,19 @@ export class DefaultLedgerSession implements LedgerSession {
     onError?: (error: Error) => void
   ): () => void {
     return eventStore.subscribe(this.ledgerId, async (rawEvents) => {
-      const events = await processLedgerEventSnapshot(rawEvents, this.symmetricKey);
-      onUpdate(events);
+      try {
+        const events = await processLedgerEventSnapshot(
+          rawEvents,
+          this.symmetricKey,
+          { authorizedSigners: this.authorizedSigners, cache: this.eventCache }
+        );
+        onUpdate(events);
+      } catch (err: any) {
+        // The async snapshot handler can reject independently of the underlying
+        // listener; surface it to the caller instead of swallowing it.
+        console.error("[charproof] Failed to process ledger snapshot:", err);
+        onError?.(err);
+      }
     }, onError);
   }
 

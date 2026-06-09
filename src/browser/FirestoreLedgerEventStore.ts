@@ -8,7 +8,6 @@ import {
   getDocs,
   limit,
   serverTimestamp,
-  getDoc,
   writeBatch
 } from "firebase/firestore";
 import { getDb } from "../config";
@@ -33,13 +32,42 @@ function generateRealisticDecoy(encLength: number, ivLength: number): { encrypte
   return { encryptedData, iv };
 }
 
+export interface LedgerEventStoreOptions {
+  /**
+   * Ledger IDs that belong to THIS user and that this user is permitted to write
+   * to. When non-empty, each real write is accompanied by decoy writes into a
+   * random subset of these ledgers, hiding which ledger actually changed.
+   *
+   * IMPORTANT: only the caller's own ledgers may appear here. The previous
+   * implementation pulled a global cross-tenant pool and wrote decoys into other
+   * users' ledgers, which both leaked the set of active ledgers and required
+   * security rules permitting any user to write to any ledger. Decoys are now
+   * strictly tenant-local and opt-in.
+   */
+  decoyPool?: string[];
+  /** Number of decoy writes per real write. Default: 3. */
+  decoyCount?: number;
+}
+
 export class FirestoreLedgerEventStore implements LedgerEventStore {
+  private decoyPool: string[];
+  private readonly decoyCount: number;
+
+  constructor(options?: LedgerEventStoreOptions) {
+    this.decoyPool = options?.decoyPool ? [...options.decoyPool] : [];
+    this.decoyCount = options?.decoyCount ?? 3;
+  }
+
+  /** Updates the set of the user's own ledgers eligible to receive decoy writes. */
+  setDecoyPool(ledgerIds: string[]): void {
+    this.decoyPool = [...ledgerIds];
+  }
+
   async appendEvent(ledgerId: string, eventId: string, data: { encryptedData: string; iv: string }): Promise<void> {
     const db = getDb();
     const batch = writeBatch(db);
-    const X = 3; // Configurable number of decoy writes
 
-    // 1. Queue the legitimate event write
+    // 1. The legitimate event write.
     const realRef = doc(db, "polls", ledgerId, "events", eventId);
     batch.set(realRef, {
       eventId,
@@ -48,76 +76,29 @@ export class FirestoreLedgerEventStore implements LedgerEventStore {
       iv: data.iv
     });
 
-    try {
-      // 2. Fetch the current chaff pool
-      const poolSnap = await getDoc(doc(db, "chaff_pool", "current"));
-      let activePolls: string[] = [];
+    // 2. Tenant-local decoy writes (only into the user's own registered ledgers).
+    //    Built once, so a transient-error retry replays the same batch (idempotent).
+    const candidates = this.decoyPool.filter(id => id !== ledgerId);
+    if (candidates.length > 0 && this.decoyCount > 0) {
+      const selected = candidates
+        .slice()
+        .sort(() => 0.5 - Math.random())
+        .slice(0, this.decoyCount);
 
-      if (poolSnap.exists()) {
-        activePolls = poolSnap.data().activePollIds || [];
-        try {
-          localStorage.setItem("charproof_chaff_pool", JSON.stringify(activePolls));
-        } catch (e) {
-          // Safe fallback for private browsing or full storage
-        }
-      }
-
-      if (activePolls.length > 0) {
-        // Exclude our own ledgerId to avoid writing self-chaff
-        const candidates = activePolls.filter(id => id !== ledgerId);
-        
-        // Randomly select up to X candidate IDs
-        const selectedChaffIds = candidates
-          .sort(() => 0.5 - Math.random())
-          .slice(0, X);
-
-        // 3. Queue the decoy chaff writes
-        for (const chaffId of selectedChaffIds) {
-          const decoyEventId = generateId();
-          const decoyRef = doc(db, "polls", chaffId, "events", decoyEventId);
-          
-          // Generate realistic decoy payload matching character lengths of original data
-          const decoyPayload = generateRealisticDecoy(data.encryptedData.length, data.iv.length);
-          
-          batch.set(decoyRef, {
-            eventId: decoyEventId,
-            createdAt: serverTimestamp(),
-            encryptedData: decoyPayload.encryptedData,
-            iv: decoyPayload.iv
-          });
-        }
-      }
-    } catch (err) {
-      // Try local storage fallback before giving up on chaff generation
-      console.warn("Failed to fetch chaff pool from network. Attempting local storage cache fallback...", err);
-      try {
-        const cachedPoolStr = localStorage.getItem("charproof_chaff_pool");
-        if (cachedPoolStr) {
-          const cachedPolls: string[] = JSON.parse(cachedPoolStr) || [];
-          const candidates = cachedPolls.filter(id => id !== ledgerId);
-          const selectedChaffIds = candidates
-            .sort(() => 0.5 - Math.random())
-            .slice(0, X);
-
-          for (const chaffId of selectedChaffIds) {
-            const decoyEventId = generateId();
-            const decoyRef = doc(db, "polls", chaffId, "events", decoyEventId);
-            const decoyPayload = generateRealisticDecoy(data.encryptedData.length, data.iv.length);
-            
-            batch.set(decoyRef, {
-              eventId: decoyEventId,
-              createdAt: serverTimestamp(),
-              encryptedData: decoyPayload.encryptedData,
-              iv: decoyPayload.iv
-            });
-          }
-        }
-      } catch (cacheErr) {
-        console.error("Local chaff pool cache fallback failed:", cacheErr);
+      for (const chaffId of selected) {
+        const decoyEventId = generateId();
+        const decoyRef = doc(db, "polls", chaffId, "events", decoyEventId);
+        const decoyPayload = generateRealisticDecoy(data.encryptedData.length, data.iv.length);
+        batch.set(decoyRef, {
+          eventId: decoyEventId,
+          createdAt: serverTimestamp(),
+          encryptedData: decoyPayload.encryptedData,
+          iv: decoyPayload.iv
+        });
       }
     }
 
-    // 4. Commit all writes simultaneously in a single network request (with retry)
+    // 3. Commit all writes atomically (with transient-error retry).
     await withRetry(() => batch.commit());
   }
 
@@ -161,7 +142,7 @@ export class FirestoreLedgerEventStore implements LedgerEventStore {
 
   async createLedger(ledgerId: string): Promise<void> {
     const ref = doc(getDb(), "polls", ledgerId);
-    await withRetry(() => setDoc(ref, { 
+    await withRetry(() => setDoc(ref, {
       pollId: ledgerId,
       createdAt: serverTimestamp()
     }));

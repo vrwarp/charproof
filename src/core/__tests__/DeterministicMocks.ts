@@ -374,6 +374,14 @@ export class MockAccountKeyStore implements AccountKeyStore {
     this.accountKeys = JSON.parse(JSON.stringify(doc));
   }
 
+  async createAccountKeys(doc: AccountKeysDocument): Promise<boolean> {
+    if (this.accountKeys) {
+      return false;
+    }
+    this.accountKeys = JSON.parse(JSON.stringify(doc));
+    return true;
+  }
+
   async getKeystoreEntry(ledgerId: string): Promise<KeystoreEntry | null> {
     const entry = this.keystore[ledgerId];
     return entry ? JSON.parse(JSON.stringify(entry)) : null;

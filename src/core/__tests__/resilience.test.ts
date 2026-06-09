@@ -73,19 +73,10 @@ describe("Resilience and Safe Degradation", () => {
     });
   });
 
-  describe("FirestoreLedgerEventStore - ZK Decoy Chaff Caching & Fallback", () => {
-    it("should cache chaff pool IDs on success, and use them on network failure", async () => {
+  describe("FirestoreLedgerEventStore - Tenant-Local Decoy Chaff", () => {
+    it("writes only the real event when no decoy pool is configured", async () => {
       const store = new FirestoreLedgerEventStore();
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-      // 1. Success Path - Cache active poll IDs
-      const mockSnapshot = {
-        exists: () => true,
-        data: () => ({ activePollIds: ["poll-a", "poll-b"] }),
-      };
-      vi.mocked(firestore.getDoc).mockResolvedValue(mockSnapshot as any);
-
-      // We append an event
       const batchMock = {
         set: vi.fn(),
         commit: vi.fn().mockResolvedValue(undefined),
@@ -94,24 +85,45 @@ describe("Resilience and Safe Degradation", () => {
 
       await store.appendEvent("my-ledger", "event-123", { encryptedData: "enc", iv: "iv" });
 
-      // Verify cached in localStorage
-      const cached = localStorage.getItem("charproof_chaff_pool");
-      expect(cached).toBe(JSON.stringify(["poll-a", "poll-b"]));
+      // Exactly one write (the real event) — no decoys, no cross-tenant writes.
+      expect(batchMock.set).toHaveBeenCalledTimes(1);
+      expect(batchMock.commit).toHaveBeenCalledTimes(1);
+      // It must NOT read any global chaff pool document.
+      expect(firestore.getDoc).not.toHaveBeenCalled();
+    });
 
-      // 2. Failure Path - Fallback to cache
-      vi.mocked(firestore.getDoc).mockRejectedValue(new Error("Network Down"));
+    it("writes decoys only into the user's own configured ledgers, never foreign ones", async () => {
+      const store = new FirestoreLedgerEventStore({ decoyPool: ["mine-a", "mine-b", "mine-c"], decoyCount: 2 });
 
-      await store.appendEvent("my-ledger", "event-456", { encryptedData: "enc", iv: "iv" });
+      const batchMock = {
+        set: vi.fn(),
+        commit: vi.fn().mockResolvedValue(undefined),
+      };
+      vi.mocked(firestore.writeBatch).mockReturnValue(batchMock as any);
 
-      // Should log fallback warning
-      expect(warnSpy.mock.calls[0][0]).toContain(
-        "Failed to fetch chaff pool from network. Attempting local storage cache fallback..."
-      );
+      // Track which (collection) paths were targeted via the doc() mock.
+      vi.mocked(firestore.doc).mockImplementation((...args: any[]) => ({ path: args.join("/") }) as any);
 
-      // Decoys should be queued from cache
-      expect(batchMock.set).toHaveBeenCalled();
-      
-      warnSpy.mockRestore();
+      await store.appendEvent("mine-a", "event-123", { encryptedData: "enc", iv: "iv" });
+
+      // 1 real + 2 decoys = 3 writes.
+      expect(batchMock.set).toHaveBeenCalledTimes(3);
+
+      // Every targeted ledger must be one of the user's own ledgers — never a foreign poll.
+      const targetedLedgers = batchMock.set.mock.calls.map((call) => {
+        const path: string = call[0].path; // e.g. "<db>/polls/<ledgerId>/events/<eventId>"
+        const m = path.match(/polls\/([^/]+)\/events/);
+        return m ? m[1] : null;
+      });
+      for (const ledger of targetedLedgers) {
+        expect(["mine-a", "mine-b", "mine-c"]).toContain(ledger);
+      }
+      // The decoys must not target the real ledger itself.
+      const decoyLedgers = targetedLedgers.filter((l) => l !== "mine-a");
+      expect(decoyLedgers.length).toBe(2);
+      for (const ledger of decoyLedgers) {
+        expect(["mine-b", "mine-c"]).toContain(ledger);
+      }
     });
 
     it("should retry genesis event fetches on transient errors", async () => {

@@ -1,0 +1,53 @@
+rules_version = '2';
+
+// Charproof reference Firestore security rules.
+//
+// The zero-knowledge guarantees of Charproof are ONLY as strong as these rules.
+// Ciphertext confidentiality is enforced client-side, but document INTEGRITY and
+// ACCESS CONTROL are enforced here. Deploy rules equivalent to these (adapt the
+// `polls` collection name if you renamed the ledger collection).
+//
+// Threat model notes:
+//  * Per-user key material (account_keys, keystore, pending_devices) is strictly
+//    owner-only: no other authenticated user may read or write it.
+//  * The shared ledger (`polls` + `events`) is intentionally reachable by anyone
+//    who holds the share link + symmetric key, so events are world-readable to
+//    authenticated users and APPEND-ONLY. Events are immutable once written
+//    (no update/delete), so the log cannot be silently rewritten by the server
+//    or other clients. Authorship is authenticated client-side via the
+//    authorized-signers allowlist (see SECURITY.md) — Firestore cannot verify
+//    signatures, so do NOT rely on these rules for authorship.
+//  * There is deliberately NO global "chaff pool" document and NO cross-tenant
+//    write path. Decoy writes are tenant-local (a user writing into their own
+//    ledgers), which is covered by the same append-only event rule.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // ── Per-user zero-knowledge key material (owner-only) ──────────────
+    match /users/{uid}/{document=**} {
+      allow read, write: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    // ── Shared, link-accessible ledgers ────────────────────────────────
+    match /polls/{ledgerId} {
+      // Ledger metadata: readable by any signed-in user; creatable once;
+      // never updatable or deletable (immutable pointer document).
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update, delete: if false;
+
+      // Append-only encrypted event log.
+      match /events/{eventId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn();
+        // Immutable: events can never be modified or removed after creation.
+        allow update, delete: if false;
+      }
+    }
+  }
+}

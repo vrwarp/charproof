@@ -2,29 +2,35 @@ import type { Firestore } from "firebase/firestore";
 import type { Auth } from "firebase/auth";
 import { setCryptoProvider } from "./core/crypto";
 import { WebCryptoProvider } from "./browser/WebCryptoProvider";
-import { MockCryptoProvider } from "./mock/MockCryptoProvider";
-import { MockPrfProvider } from "./mock/MockPrfProvider";
-import { FirestoreAccountKeyStore } from "./browser/FirestoreAccountKeyStore";
 import { setPrfProviders } from "./prfService";
-import { setDeviceServiceProviders } from "./deviceService";
+import type { CryptoProvider, PrfProvider } from "./core/interfaces";
 
 let db: Firestore | null = null;
 let auth: Auth | null = null;
 
-export function initializeZK(config: { db: Firestore; auth: Auth }) {
+export interface InitializeZKConfig {
+  db: Firestore;
+  auth: Auth;
+  /**
+   * Optional cryptographic provider override. Defaults to the browser's
+   * WebCrypto-backed provider. Supply a custom provider ONLY for testing — this
+   * is the single, explicit injection point. There is intentionally no ambient
+   * (e.g. `window`-global) switch: a runtime-toggleable mock in the production
+   * crypto path would let any XSS/extension downgrade encryption to plaintext.
+   */
+  cryptoProvider?: CryptoProvider;
+  /** Optional WebAuthn PRF provider override (testing only). */
+  prfProvider?: PrfProvider;
+}
+
+export function initializeZK(config: InitializeZKConfig) {
   db = config.db;
   auth = config.auth;
-  const isMockMode =
-    (typeof window !== "undefined" && (window as any).__MOCK_ZK === "true");
 
-  if (isMockMode) {
-    console.warn("⚠️ DEBUG: Zero-Knowledge package running in MOCK mode.");
-    setCryptoProvider(new MockCryptoProvider());
-    setPrfProviders({ prfProvider: new MockPrfProvider() });
-    setDeviceServiceProviders({ accountKeyStore: new FirestoreAccountKeyStore() });
-  } else {
-    // Automatically initialize browser-based WebCryptoProvider
-    setCryptoProvider(new WebCryptoProvider());
+  setCryptoProvider(config.cryptoProvider ?? new WebCryptoProvider());
+
+  if (config.prfProvider) {
+    setPrfProviders({ prfProvider: config.prfProvider });
   }
 }
 

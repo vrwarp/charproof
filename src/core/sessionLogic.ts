@@ -48,11 +48,22 @@ export async function prepareAppendEventEnvelope(
 export async function decryptAndValidateEvent(
   encryptedData: string,
   iv: string,
-  symmetricKey: AesGcmKey
+  symmetricKey: AesGcmKey,
+  authorizedSigners?: Set<string> | null
 ): Promise<DecryptedLedgerEvent | null> {
   try {
     const json = await decryptPayload(symmetricKey, { encryptedData, iv });
     const envelope = JSON.parse(json);
+
+    // Authorship authentication: when an allowlist is supplied, the embedded
+    // signer key must be a known-authorized participant. Without this, anyone
+    // holding the shared symmetric key could mint a keypair and impersonate
+    // another author, since the signature only certifies its own embedded key.
+    if (authorizedSigners && !authorizedSigners.has(envelope.publicKey)) {
+      console.warn("Rejecting event signed by an unauthorized public key.");
+      return null;
+    }
+
     const isValid = await verifySignature(envelope.publicKey, envelope.signature, envelope.action);
     if (isValid) {
       return { signerPublicKey: envelope.publicKey, action: envelope.action };
@@ -63,14 +74,37 @@ export async function decryptAndValidateEvent(
   return null;
 }
 
+export interface ProcessSnapshotOptions {
+  /** Allowlist of authorized signer public keys; see decryptAndValidateEvent. */
+  authorizedSigners?: Set<string> | null;
+  /** Optional memoization cache keyed by `${id}:${iv}` to skip re-decrypting
+   *  events that were already processed in a previous snapshot. */
+  cache?: Map<string, DecryptedLedgerEvent | null>;
+}
+
 export async function processLedgerEventSnapshot(
   rawEvents: Array<{ encryptedData: string; iv: string; id: string }>,
-  symmetricKey: AesGcmKey
+  symmetricKey: AesGcmKey,
+  options: ProcessSnapshotOptions = {}
 ): Promise<DecryptedLedgerEvent[]> {
-  const decryptedPromises = rawEvents.map(raw =>
-    decryptAndValidateEvent(raw.encryptedData, raw.iv, symmetricKey)
+  const { authorizedSigners = null, cache } = options;
+
+  const decryptedResults = await Promise.all(
+    rawEvents.map(async raw => {
+      const cacheKey = `${raw.id}:${raw.iv}`;
+      if (cache && cache.has(cacheKey)) {
+        return cache.get(cacheKey) ?? null;
+      }
+      const result = await decryptAndValidateEvent(
+        raw.encryptedData,
+        raw.iv,
+        symmetricKey,
+        authorizedSigners
+      );
+      if (cache) cache.set(cacheKey, result);
+      return result;
+    })
   );
-  const decryptedResults = await Promise.all(decryptedPromises);
 
   const events: DecryptedLedgerEvent[] = [];
   for (const decrypted of decryptedResults) {
@@ -81,10 +115,14 @@ export async function processLedgerEventSnapshot(
   return events;
 }
 
+/** Encrypted owner-recovery payload plus the PBKDF2 parameters needed to
+ *  re-derive the token key during recovery. */
+export type OwnerRecoveryEnvelope = EncryptedData & { kdfSalt: string; kdfIterations: number };
+
 export interface GenesisMaterial {
   creds: LedgerCredentials;
   ownershipToken: string;
-  ownerRecovery: EncryptedData;
+  ownerRecovery: OwnerRecoveryEnvelope;
   symmetricKey: AesGcmKey;
   signingPrivateKey: EcdsaPrivateKey;
   signingPublicKey: EcdsaPublicKey;
@@ -98,10 +136,13 @@ export async function prepareGenesisCredentials(): Promise<GenesisMaterial> {
   const privB64 = await exportPrivateKey(keyPair.privateKey);
   const pubB64 = await exportPublicKey(keyPair.publicKey);
 
-  // Generate ownership recovery token
+  // Generate ownership recovery token. The PBKDF2 salt + iteration count are
+  // stored inside the recovery envelope so the key can be re-derived; the salt
+  // is random per-ledger rather than a shared constant.
   const ownershipToken = getCrypto().randomUUID();
-  const tokenKey = await deriveKeyFromPassword(ownershipToken);
-  const ownerRecovery = await encryptPayload(tokenKey, privB64);
+  const { key: tokenKey, salt: kdfSalt, iterations: kdfIterations } = await deriveKeyFromPassword(ownershipToken);
+  const encryptedOwner = await encryptPayload(tokenKey, privB64);
+  const ownerRecovery = { ...encryptedOwner, kdfSalt, kdfIterations };
 
   const creds: LedgerCredentials = {
     symmetricKey: b64Key,
@@ -132,8 +173,12 @@ export async function attemptRecoveryWithToken(
     const envelope = JSON.parse(json);
     
     if (envelope.__ownerRecovery) {
-      const tokenKey = await deriveKeyFromPassword(ownershipToken);
-      const privB64 = await decryptPayload(tokenKey, envelope.__ownerRecovery);
+      const rec = envelope.__ownerRecovery;
+      const { key: tokenKey } = await deriveKeyFromPassword(ownershipToken, {
+        salt: rec.kdfSalt,
+        iterations: rec.kdfIterations
+      });
+      const privB64 = await decryptPayload(tokenKey, rec);
       const pubB64 = envelope.publicKey;
       
       return {

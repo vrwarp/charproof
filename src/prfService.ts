@@ -70,8 +70,14 @@ export async function derivePrfMasterKey(credentialIds?: string[]): Promise<{ ma
         prfResult = assertion.prfResult;
       }
 
-      // Reconstitute Master Key
-      const masterKey = await getCrypto().importSymmetricKey(prfResult.slice(0, 16) as any);
+      // Reconstitute Master Key.
+      // Use the full 256 bits of PRF output (WebAuthn PRF `first` returns 32 bytes)
+      // so the recovery key is as strong as the AES-256 AMK it protects. Previously
+      // this truncated to 16 bytes (AES-128), making recovery the weakest link.
+      if (prfResult.length < 32) {
+        throw new Error(`PRF output too short (${prfResult.length} bytes); expected at least 32.`);
+      }
+      const masterKey = await getCrypto().importSymmetricKey(prfResult.slice(0, 32) as any);
 
       // Always update local storage and IndexedDB with the successfully used credential
       local.setPrfCredentialId(user.uid, usedId);

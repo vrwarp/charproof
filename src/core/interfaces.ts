@@ -123,6 +123,15 @@ export interface AccountKeyStore {
   /** Directly overwrites the root account keys document (used during genesis initialization). */
   setAccountKeys(doc: AccountKeysDocument): Promise<void>;
 
+  /**
+   * Atomically creates the root account keys document only if it does not yet
+   * exist. Returns `true` if this call created it, `false` if a document was
+   * already present (e.g. a concurrent genesis on another tab/device won the race).
+   * Prevents a second genesis from silently overwriting the first and locking the
+   * winning device out.
+   */
+  createAccountKeys(doc: AccountKeysDocument): Promise<boolean>;
+
   /** Retrieves a wrapped ledger symmetric key from the keystore. */
   getKeystoreEntry(ledgerId: string): Promise<KeystoreEntry | null>;
 

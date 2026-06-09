@@ -76,6 +76,8 @@ export {
   verifyAmk,
   requestDeviceAuthorization,
   approveDeviceAuthorization,
+  getVerificationCodeForPublicKey,
+  getLocalVerificationCode,
   setDeviceServiceProviders,
   subscribePendingRequests,
   subscribeAuthorizedDevices,
@@ -101,5 +103,12 @@ export {
   DefaultLedgerSession,
   createLedgerSession,
   getLedgerSession,
-  setSessionProviders
+  setSessionProviders,
+  setLedgerDecoyPool
 } from "./session";
+
+// Ledger event store (export so apps can inject a decoy-configured instance)
+export {
+  FirestoreLedgerEventStore,
+  type LedgerEventStoreOptions
+} from "./browser/FirestoreLedgerEventStore";

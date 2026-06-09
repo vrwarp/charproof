@@ -12,7 +12,9 @@
   },
   "homepage": "https://github.com/vrwarp/charproof#readme",
   "files": [
-    "dist"
+    "dist",
+    "firestore.rules",
+    "SECURITY.md"
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -24,6 +26,7 @@
     }
   },
   "scripts": {
+    "prebuild": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "tsc",
     "test": "vitest run",
     "example": "tsx examples/demo.ts"
