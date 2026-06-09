@@ -15,7 +15,8 @@ import {
   unwrapAmk,
   wrapAmk,
   decryptHybrid,
-  blindLedgerId
+  blindLedgerId,
+  generateVerificationCode
 } from "./core/crypto";
 import {
   unwrapActiveAmk,
@@ -86,10 +87,23 @@ let cachedAmk: AesGcmKey | null = null;
 let cachedAmkId: string | null = null;
 let verificationPromise: Promise<{ amk: AesGcmKey, amkId: string }> | null = null;
 
+// Cache of unwrapped AMKs keyed by amkId (active + historical). Avoids repeated
+// RSA-OAEP unwraps and account-document reads when resolving keystore entries
+// across many key rotations. AMK bytes for a given amkId never change, so this
+// is safe for the lifetime of the session.
+const amkByIdCache = new Map<string, AesGcmKey>();
+
+// Memoizes the decrypted ledgerId of a keystore entry. AES-GCM IVs are unique
+// per encryption, so (amkId, iv) uniquely identifies an immutable ciphertext —
+// safe to cache and avoids re-decrypting the whole keystore on every snapshot.
+const keystoreLedgerIdCache = new Map<string, string>();
+
 export function clearAmkSessionCache() {
   cachedAmk = null;
   cachedAmkId = null;
   verificationPromise = null;
+  amkByIdCache.clear();
+  keystoreLedgerIdCache.clear();
 }
 
 export async function getActiveAmk(): Promise<{ amk: AesGcmKey, amkId: string }> {
@@ -113,6 +127,7 @@ export async function getActiveAmk(): Promise<{ amk: AesGcmKey, amkId: string }>
         const result = await setupGenesisDevice(user.uid);
         cachedAmk = result.amk;
         cachedAmkId = result.amkId;
+        amkByIdCache.set(result.amkId, result.amk);
         return result;
       }
 
@@ -128,6 +143,7 @@ export async function getActiveAmk(): Promise<{ amk: AesGcmKey, amkId: string }>
           await registerCurrentDevice(recovered.amk, recovered.amkId);
           cachedAmk = recovered.amk;
           cachedAmkId = recovered.amkId;
+          amkByIdCache.set(recovered.amkId, recovered.amk);
           return recovered;
         }
 
@@ -145,6 +161,7 @@ export async function getActiveAmk(): Promise<{ amk: AesGcmKey, amkId: string }>
 
       cachedAmk = await getCrypto().importSymmetricKey(new Uint8Array(amkBuffer) as RawKeyBytes);
       cachedAmkId = amkId;
+      amkByIdCache.set(amkId, cachedAmk);
 
       opportunisticallyEnableRecovery().catch(e => console.warn("Opportunistic recovery check failed:", e));
 
@@ -168,7 +185,15 @@ export async function getAmkById(targetAmkId: string): Promise<AesGcmKey> {
   const user = auth.getCurrentUser();
   if (!user || user.isAnonymous) throw new Error("Must be signed in.");
 
+  // Fast path: already unwrapped this AMK version earlier in the session.
+  const cached = amkByIdCache.get(targetAmkId);
+  if (cached) return cached;
+
   await getActiveAmk();
+
+  // getActiveAmk may have populated the cache (for the active AMK).
+  const afterActive = amkByIdCache.get(targetAmkId);
+  if (afterActive) return afterActive;
 
   const deviceId = getDeviceId();
   const accountKeys = await store.getAccountKeys();
@@ -184,7 +209,9 @@ export async function getAmkById(targetAmkId: string): Promise<AesGcmKey> {
 
   const amkBuffer = await unwrapAmkById(accountKeys, deviceId, deviceKeys.privateKey, targetAmkId);
 
-  return await getCrypto().importSymmetricKey(new Uint8Array(amkBuffer) as RawKeyBytes);
+  const amk = await getCrypto().importSymmetricKey(new Uint8Array(amkBuffer) as RawKeyBytes);
+  amkByIdCache.set(targetAmkId, amk);
+  return amk;
 }
 
 async function opportunisticallyEnableRecovery() {
@@ -306,6 +333,7 @@ export async function registerCurrentDevice(amk: AesGcmKey, amkId: string): Prom
 
   cachedAmk = amk;
   cachedAmkId = amkId;
+  amkByIdCache.set(amkId, amk);
 }
 
 async function setupGenesisDevice(uid: string): Promise<{ amk: AesGcmKey, amkId: string }> {
@@ -339,10 +367,40 @@ async function setupGenesisDevice(uid: string): Promise<{ amk: AesGcmKey, amkId:
     prfMethodId
   );
 
-  // Commit to Firestore first
-  await store.setAccountKeys(doc);
+  // Atomically create the document only if absent. If a concurrent genesis (e.g.
+  // another tab) already created one, we MUST NOT overwrite it — doing so would
+  // discard the winner's wrapped AMK and lock it out.
+  const created = await store.createAccountKeys(doc);
 
-  // Only persist device keys after Firestore succeeds (safe for both fresh + retry)
+  if (!created) {
+    // We lost the genesis race (another tab/device created the document first).
+    // Do NOT persist our freshly-generated keys: in shared IndexedDB that would
+    // clobber the winning device's keys and lock it out. Instead, recover the
+    // AMK from the winning document using whatever keys are already registered
+    // for this device (the winner's, if this is the same device).
+    const winningDoc = await store.getAccountKeys();
+    if (!winningDoc) {
+      const err = new Error("Genesis race lost but no account document is present; retry.");
+      (err as any).retryable = true;
+      throw err;
+    }
+    const winningAmkId = winningDoc.activeAmkId;
+    const deviceKeys = await local.loadDeviceKeys();
+    const wrapped = deviceKeys ? winningDoc.keyring[winningAmkId]?.[deviceId] : undefined;
+    if (!wrapped || !deviceKeys) {
+      const err = new Error(
+        "UNRECOGNIZED_DEVICE: A concurrent genesis created the account with different keys. " +
+        "Re-authorize this device or recover via a recovery method."
+      );
+      (err as any).retryable = false;
+      throw err;
+    }
+    const amkBuffer = await unwrapAmkById(winningDoc, deviceId, deviceKeys.privateKey, winningAmkId);
+    const amk = await getCrypto().importSymmetricKey(new Uint8Array(amkBuffer) as RawKeyBytes);
+    return { amk, amkId: winningAmkId };
+  }
+
+  // We won: only persist device keys after the remote create succeeds.
   await local.saveDeviceKeys({ privateKey: privB64, publicKey: pubB64 });
 
   const amk = await getCrypto().importSymmetricKey(new Uint8Array(rawAmk) as RawKeyBytes);
@@ -418,6 +476,7 @@ export async function revokeDevice(revokedDeviceId: string) {
     const amkBuffer = base64UrlToUint8(rawNewAmk);
     cachedAmk = await getCrypto().importSymmetricKey(new Uint8Array(amkBuffer.buffer as ArrayBuffer) as RawKeyBytes);
     cachedAmkId = newAmkId;
+    amkByIdCache.set(newAmkId, cachedAmk);
   } catch (e) {
     console.warn("[charproof] Post-rotation cache update failed. Clearing cache for self-healing.", e);
     clearAmkSessionCache();
@@ -541,10 +600,52 @@ export async function requestDeviceAuthorization(): Promise<void> {
   await store.setPendingDevice(deviceId, pendingData);
 }
 
-export async function approveDeviceAuthorization(pendingDevice: PendingDevice): Promise<void> {
+/**
+ * Computes the 6-digit verification code for a given device public key. The
+ * enrolling device and the approving device should display this code so a human
+ * can confirm out-of-band that they match BEFORE approval, preventing a MITM who
+ * injected their own public key into the pending request from being granted the AMK.
+ */
+export async function getVerificationCodeForPublicKey(publicKeyB64: string): Promise<string> {
+  return generateVerificationCode(publicKeyB64);
+}
+
+/** Verification code for THIS device's own public key (shown on the enrolling device). */
+export async function getLocalVerificationCode(): Promise<string | null> {
+  const keys = await local.loadDeviceKeys();
+  if (!keys) return null;
+  return generateVerificationCode(keys.publicKey);
+}
+
+export interface ApproveDeviceOptions {
+  /**
+   * If provided, approval proceeds only when the verification code derived from
+   * the pending device's public key matches this value. Strongly recommended:
+   * have the user compare the code shown on both devices before approving.
+   */
+  expectedVerificationCode?: string;
+}
+
+export async function approveDeviceAuthorization(
+  pendingDevice: PendingDevice,
+  options?: ApproveDeviceOptions
+): Promise<void> {
   const currentDeviceId = getDeviceId();
   const localKeys = await local.loadDeviceKeys();
   if (!localKeys) throw new Error("Local device keys missing.");
+
+  // Out-of-band MITM check: the AMK is about to be wrapped to the pending
+  // device's public key. If a verification code was supplied, ensure it matches
+  // the key we're actually about to trust.
+  if (options?.expectedVerificationCode !== undefined) {
+    const actualCode = await generateVerificationCode(pendingDevice.publicKey);
+    if (actualCode !== options.expectedVerificationCode) {
+      throw new Error(
+        "VERIFICATION_CODE_MISMATCH: The pending device's verification code does not match. " +
+        "Approval aborted to prevent authorizing an impostor device."
+      );
+    }
+  }
 
   const { amk, amkId } = await getActiveAmk();
 
@@ -708,11 +809,19 @@ export function subscribeToUserKeystore(
     try {
       const processed = await Promise.all(
         entries.map(async (entry) => {
+          const cacheKey = `${entry.amkId}:${entry.iv}`;
+          const cachedLedgerId = keystoreLedgerIdCache.get(cacheKey);
+          if (cachedLedgerId !== undefined) {
+            return { ...entry, ledgerId: cachedLedgerId };
+          }
           try {
             // Decrypt the entry to retrieve the ledgerId from the secure envelope.
             const amk = await getAmkById(entry.amkId);
             const json = await decryptPayload(amk, entry);
             const decrypted = JSON.parse(json);
+            if (typeof decrypted.ledgerId === "string") {
+              keystoreLedgerIdCache.set(cacheKey, decrypted.ledgerId);
+            }
             return {
               ...entry,
               ledgerId: decrypted.ledgerId

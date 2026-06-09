@@ -76,6 +76,8 @@ export {
   verifyAmk,
   requestDeviceAuthorization,
   approveDeviceAuthorization,
+  getVerificationCodeForPublicKey,
+  getLocalVerificationCode,
   setDeviceServiceProviders,
   subscribePendingRequests,
   subscribeAuthorizedDevices,

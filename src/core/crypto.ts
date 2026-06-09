@@ -191,10 +191,47 @@ export async function decryptHybrid(
   return decryptPayload(aesKey, payload);
 }
 
-export async function deriveKeyFromPassword(password: string): Promise<Pbkdf2DerivedKey> {
+/**
+ * OWASP-recommended PBKDF2-SHA256 work factor (2023+). Higher than the previous
+ * 100,000 to make offline brute-force of password/token-derived keys costlier.
+ */
+export const PBKDF2_ITERATIONS = 600000;
+
+export interface DerivedKeyResult {
+  key: Pbkdf2DerivedKey;
+  /** Base64url-encoded random salt used for this derivation. Must be persisted
+   *  alongside the ciphertext so the key can be re-derived for decryption. */
+  salt: string;
+  iterations: number;
+}
+
+/**
+ * Derives an AES-256 key from a password/token using PBKDF2-SHA256.
+ *
+ * A fresh random 16-byte salt is generated unless one is supplied (when
+ * re-deriving for decryption). The salt and iteration count are returned so the
+ * caller can store them with the ciphertext — never reuse a hardcoded salt.
+ */
+export async function deriveKeyFromPassword(
+  password: string,
+  options?: { salt?: string; iterations?: number }
+): Promise<DerivedKeyResult> {
   const passwordBytes = new TextEncoder().encode(password) as PlaintextBytes;
-  const saltBytes = new TextEncoder().encode("letusmeet-admin-token-salt") as PlaintextBytes;
-  return getCrypto().deriveKeyFromPassword(passwordBytes, saltBytes, 100000);
+  const iterations = options?.iterations ?? PBKDF2_ITERATIONS;
+
+  let saltB64: string;
+  let saltBytes: PlaintextBytes;
+  if (options?.salt) {
+    saltB64 = options.salt;
+    saltBytes = base64UrlToUint8(options.salt) as unknown as PlaintextBytes;
+  } else {
+    const raw = getCrypto().getRandomBytes(16);
+    saltBytes = raw as unknown as PlaintextBytes;
+    saltB64 = uint8ToBase64Url(raw);
+  }
+
+  const key = await getCrypto().deriveKeyFromPassword(passwordBytes, saltBytes, iterations);
+  return { key, salt: saltB64, iterations };
 }
 
 export async function generateVerificationCode(publicKeyB64: string): Promise<string> {

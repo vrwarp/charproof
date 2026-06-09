@@ -27,6 +27,29 @@ import {
 } from "./crypto";
 import { base64ToUint8 } from "./base64";
 
+/**
+ * Safely parses a base64-encoded `{ ciphertext, iv }` envelope that originates
+ * from the untrusted database. Throws a clear, typed error instead of letting a
+ * malformed or hostile document throw deep inside the crypto layer.
+ */
+export function parseEncryptedEnvelopeB64(b64: string): { ciphertext: string; iv: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(atob(b64));
+  } catch (e) {
+    throw new Error("MALFORMED_ENVELOPE: wrapped payload is not valid base64-encoded JSON.");
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    typeof (parsed as any).ciphertext !== "string" ||
+    typeof (parsed as any).iv !== "string"
+  ) {
+    throw new Error("MALFORMED_ENVELOPE: wrapped payload missing string `ciphertext`/`iv` fields.");
+  }
+  return { ciphertext: (parsed as any).ciphertext, iv: (parsed as any).iv };
+}
+
 export async function unwrapActiveAmk(
   data: AccountKeysDocument,
   deviceId: string,
@@ -65,7 +88,7 @@ export async function tryRecoverAmkWithPrfKey(
     return null;
   }
 
-  const parsed = JSON.parse(atob(wrappedAmk));
+  const parsed = parseEncryptedEnvelopeB64(wrappedAmk);
   const cipherBytes = base64ToUint8(parsed.ciphertext) as CiphertextBytes;
   const ivBytes = base64ToUint8(parsed.iv) as IvBytes;
   
@@ -176,9 +199,20 @@ export async function rotateKeys(
   prfKey?: AesGcmKey
 ): Promise<AccountKeysDocument> {
   const updatedDoc = JSON.parse(JSON.stringify(currentDoc)) as AccountKeysDocument;
-  
+
   // Remove revoked device
   delete updatedDoc.devices[revokedDeviceId];
+
+  // Purge the revoked device's wrapped-AMK entries from EVERY keyring version
+  // (not just the new one). Otherwise the revoked device could still unwrap any
+  // historical AMK it was granted, defeating revocation for past key versions.
+  //
+  // NOTE: This cannot retroactively protect ledger/keystore data the revoked
+  // device already decrypted while authorized — revocation is forward-only for
+  // data that was already accessible. See SECURITY.md ("Revocation semantics").
+  for (const versionId in updatedDoc.keyring) {
+    delete updatedDoc.keyring[versionId][revokedDeviceId];
+  }
 
   // Re-encrypt remaining device names
   for (const deviceId in updatedDoc.devices) {

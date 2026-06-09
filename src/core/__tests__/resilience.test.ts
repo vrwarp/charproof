@@ -3,6 +3,7 @@ import { BrowserLocalDeviceStore } from "../../browser/BrowserLocalDeviceStore";
 import { FirestoreAccountKeyStore } from "../../browser/FirestoreAccountKeyStore";
 import { FirestoreLedgerEventStore } from "../../browser/FirestoreLedgerEventStore";
 import { subscribeToUserKeystore } from "../../deviceService";
+import { base64ToUint8 } from "../base64";
 import * as idb from "../../idb";
 import * as firestore from "firebase/firestore";
 
@@ -73,7 +74,7 @@ describe("Resilience and Safe Degradation", () => {
     });
   });
 
-  describe("FirestoreLedgerEventStore - ZK Decoy Chaff Caching & Fallback", () => {
+  describe("FirestoreLedgerEventStore - ZK Decoy Chaff", () => {
     it("should cache chaff pool IDs on success, and use them on network failure", async () => {
       const store = new FirestoreLedgerEventStore();
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -85,33 +86,65 @@ describe("Resilience and Safe Degradation", () => {
       };
       vi.mocked(firestore.getDoc).mockResolvedValue(mockSnapshot as any);
 
-      // We append an event
       const batchMock = {
         set: vi.fn(),
         commit: vi.fn().mockResolvedValue(undefined),
       };
       vi.mocked(firestore.writeBatch).mockReturnValue(batchMock as any);
 
-      await store.appendEvent("my-ledger", "event-123", { encryptedData: "enc", iv: "iv" });
+      // Use valid base64 payloads so decoy length/format can be compared.
+      const realData = { encryptedData: btoa("a realistic ciphertext blob!!"), iv: btoa("123456789012") };
+      await store.appendEvent("my-ledger", "event-123", realData);
 
       // Verify cached in localStorage
-      const cached = localStorage.getItem("charproof_chaff_pool");
-      expect(cached).toBe(JSON.stringify(["poll-a", "poll-b"]));
+      expect(localStorage.getItem("charproof_chaff_pool")).toBe(JSON.stringify(["poll-a", "poll-b"]));
+
+      // 1 real + 2 decoys (pool minus self) = 3 writes
+      expect(batchMock.set).toHaveBeenCalledTimes(3);
 
       // 2. Failure Path - Fallback to cache
       vi.mocked(firestore.getDoc).mockRejectedValue(new Error("Network Down"));
-
-      await store.appendEvent("my-ledger", "event-456", { encryptedData: "enc", iv: "iv" });
-
-      // Should log fallback warning
+      await store.appendEvent("my-ledger", "event-456", realData);
       expect(warnSpy.mock.calls[0][0]).toContain(
         "Failed to fetch chaff pool from network. Attempting local storage cache fallback..."
       );
 
-      // Decoys should be queued from cache
-      expect(batchMock.set).toHaveBeenCalled();
-      
       warnSpy.mockRestore();
+    });
+
+    it("produces decoys indistinguishable from real payloads (valid base64, matching length)", async () => {
+      const store = new FirestoreLedgerEventStore({ decoyCount: 2 });
+
+      vi.mocked(firestore.getDoc).mockResolvedValue({
+        exists: () => true,
+        data: () => ({ activePollIds: ["poll-a", "poll-b", "poll-c"] }),
+      } as any);
+
+      const batchMock = { set: vi.fn(), commit: vi.fn().mockResolvedValue(undefined) };
+      vi.mocked(firestore.writeBatch).mockReturnValue(batchMock as any);
+
+      const realData = { encryptedData: btoa("the genuine encrypted ciphertext payload"), iv: btoa("abcdefghijkl") };
+      await store.appendEvent("real-ledger", "event-1", realData);
+
+      const base64Pattern = /^[A-Za-z0-9+/]*={0,2}$/;
+      const realEncLen = base64ToUint8(realData.encryptedData).length;
+      const realIvLen = base64ToUint8(realData.iv).length;
+
+      const decoyWrites = batchMock.set.mock.calls
+        .map((call) => call[1])
+        .filter((payload) => payload.eventId !== "event-1");
+
+      expect(decoyWrites.length).toBe(2);
+      for (const decoy of decoyWrites) {
+        // Well-formed base64 with padding only at the end (the old generator failed this).
+        expect(decoy.encryptedData).toMatch(base64Pattern);
+        expect(decoy.iv).toMatch(base64Pattern);
+        // Same decoded length as the real payload → identical on-disk footprint.
+        expect(base64ToUint8(decoy.encryptedData).length).toBe(realEncLen);
+        expect(base64ToUint8(decoy.iv).length).toBe(realIvLen);
+        // Not a copy of the real ciphertext.
+        expect(decoy.encryptedData).not.toBe(realData.encryptedData);
+      }
     });
 
     it("should retry genesis event fetches on transient errors", async () => {
@@ -174,6 +207,34 @@ describe("Resilience and Safe Degradation", () => {
 
       warnSpy.mockRestore();
       vi.useRealTimers();
+    });
+  });
+
+  describe("FirestoreAccountKeyStore - resetRemoteStore batch chunking", () => {
+    it("splits deletes into multiple batches under the 500-op limit", async () => {
+      const store = new FirestoreAccountKeyStore();
+
+      // 1000 keystore docs + 1 account doc = 1001 deletes → ceil(1001/450) = 3 batches.
+      const fakeDocs = Array.from({ length: 1000 }, (_, i) => ({ ref: { id: `doc-${i}` } }));
+      vi.mocked(firestore.getDocs).mockResolvedValue({ docs: fakeDocs } as any);
+
+      const batches: Array<{ delete: any; commit: any }> = [];
+      vi.mocked(firestore.writeBatch).mockImplementation(() => {
+        const b = { delete: vi.fn(), commit: vi.fn().mockResolvedValue(undefined) };
+        batches.push(b);
+        return b as any;
+      });
+
+      await store.resetRemoteStore();
+
+      expect(batches.length).toBe(3);
+      const totalDeletes = batches.reduce((sum, b) => sum + b.delete.mock.calls.length, 0);
+      expect(totalDeletes).toBe(1001);
+      // No batch may exceed Firestore's 500-op cap.
+      for (const b of batches) {
+        expect(b.delete.mock.calls.length).toBeLessThanOrEqual(500);
+        expect(b.commit).toHaveBeenCalledTimes(1);
+      }
     });
   });
 

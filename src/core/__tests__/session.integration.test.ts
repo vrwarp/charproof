@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from "vitest";
+import { describe, test, expect, beforeEach, vi } from "vitest";
 import { setCryptoProvider } from "../../core/crypto";
 import {
   setSessionProviders,
@@ -232,5 +232,36 @@ describe("session Integration Tests", () => {
 
   test("Access Denied throws when no credentials found and no key provided", async () => {
     await expect(getLedgerSession("non-existent-ledger")).rejects.toThrow("Access Denied");
+  });
+
+  test("subscribe routes errors thrown inside the snapshot handler to onError", async () => {
+    // Firestore does not await async snapshot callbacks, so without the
+    // try/catch inside DefaultLedgerSession.subscribe an error thrown while
+    // handling a snapshot (most realistically: the consumer's own onUpdate
+    // crashing) becomes an unhandled rejection and the subscription silently
+    // goes mute. This pins the behavior: such errors must reach onError.
+    await getActiveAmk();
+    const { session } = await createLedgerSession();
+
+    const received: Error[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const unsubscribe = session.subscribe(
+      () => {
+        throw new Error("consumer onUpdate crashed");
+      },
+      (err) => {
+        received.push(err);
+      }
+    );
+
+    await session.appendEvent({ type: "GENESIS" });
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(received.length).toBeGreaterThan(0);
+    expect(received[0].message).toContain("consumer onUpdate crashed");
+
+    unsubscribe();
+    errorSpy.mockRestore();
   });
 });

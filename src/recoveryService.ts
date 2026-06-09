@@ -1,6 +1,6 @@
 import * as bip39 from 'bip39';
-import { 
-  exportDevicePublicKey, 
+import {
+  exportDevicePublicKey,
   encrypt,
   decrypt,
   wrapAmk,
@@ -9,8 +9,10 @@ import {
   getCrypto,
   generateDeviceKeyPair,
   exportDevicePrivateKey,
-  importDevicePrivateKey
+  importDevicePrivateKey,
+  PBKDF2_ITERATIONS
 } from './core/crypto';
+import { uint8ToBase64Url, base64UrlToUint8 } from './core/base64';
 import { getActiveAmk } from './deviceService';
 import type { AccountKeysDocument } from './core/types';
 import type { AesGcmKey, RsaOaepPublicKey, RsaOaepPrivateKey, AccountKeyStore, AuthProvider, RawKeyBytes, PlaintextBytes } from './core/interfaces';
@@ -65,9 +67,11 @@ export async function setupPhraseRecovery(): Promise<string> {
   // 2. Generate random RSA-OAEP key pair for recovery using getCrypto()
   const rsaPair = await getCrypto().generateDeviceKeyPair();
 
-  // 3. Derive symmetric key from phrase
-  const protector = await deriveProtectorFromPhrase(mnemonic);
-  
+  // 3. Derive symmetric key from phrase using a fresh random salt
+  const kdfSalt = uint8ToBase64Url(getCrypto().getRandomBytes(16));
+  const kdfIterations = PBKDF2_ITERATIONS;
+  const protector = await deriveProtectorFromPhrase(mnemonic, kdfSalt, kdfIterations);
+
   // 4. Encrypt Private Key with protector
   const privKeyRaw = await getCrypto().exportDevicePrivateKey(rsaPair.privateKey);
   const privKeyB64 = btoa(String.fromCharCode(...new Uint8Array(privKeyRaw)));
@@ -89,10 +93,14 @@ export async function setupPhraseRecovery(): Promise<string> {
       publicKey: pubKeyB64,
       createdAt: Date.now()
     };
-    // Add custom field to recoveryMethods for the encrypted private key
-    (data.recoveryMethods["__recovery_phrase"] as any).encryptedPrivateKey = JSON.stringify({ 
-      ciphertext: encryptedPrivKey, 
-      iv 
+    // Add custom field to recoveryMethods for the encrypted private key,
+    // including the per-record PBKDF2 salt + iterations needed to re-derive
+    // the protector during recovery.
+    (data.recoveryMethods["__recovery_phrase"] as any).encryptedPrivateKey = JSON.stringify({
+      ciphertext: encryptedPrivKey,
+      iv,
+      kdfSalt,
+      kdfIterations
     });
     
     data.keyring[amkId]["__recovery_phrase"] = wrappedAmk;
@@ -118,11 +126,14 @@ export async function recoverAmkWithPhrase(mnemonic: string): Promise<{ amk: Aes
   const encryptedPrivData = (method as any).encryptedPrivateKey;
   if (!encryptedPrivData) throw new Error("Recovery private key missing from Firestore.");
   
-  const { ciphertext, iv } = JSON.parse(encryptedPrivData);
+  const { ciphertext, iv, kdfSalt, kdfIterations } = JSON.parse(encryptedPrivData);
 
-  // 1. Derive protector
-  const protector = await deriveProtectorFromPhrase(mnemonic);
-  
+  // 1. Derive protector. Legacy entries (pre-random-salt) carry no kdfSalt; fall
+  // back to the original constant salt + iteration count for backward compatibility.
+  const protector = kdfSalt
+    ? await deriveProtectorFromPhrase(mnemonic, kdfSalt, kdfIterations)
+    : await deriveProtectorFromPhraseLegacy(mnemonic);
+
   // 2. Decrypt RSA Private Key
   const privKeyB64 = await decrypt(protector, ciphertext, iv);
   const privKeyRaw = Uint8Array.from(atob(privKeyB64), c => c.charCodeAt(0));
@@ -140,7 +151,20 @@ export async function recoverAmkWithPhrase(mnemonic: string): Promise<{ amk: Aes
   return { amk, amkId };
 }
 
-async function deriveProtectorFromPhrase(mnemonic: string): Promise<AesGcmKey> {
+async function deriveProtectorFromPhrase(
+  mnemonic: string,
+  saltB64: string,
+  iterations: number
+): Promise<AesGcmKey> {
+  const seed = await bip39.mnemonicToSeed(mnemonic);
+  const password = new Uint8Array(seed.slice(0, 32)) as PlaintextBytes;
+  const salt = base64UrlToUint8(saltB64) as unknown as PlaintextBytes;
+  return (await getCrypto().deriveKeyFromPassword(password, salt, iterations)) as unknown as AesGcmKey;
+}
+
+/** Backward-compatible derivation for phrase recovery entries created before
+ *  per-record random salts were introduced (constant salt, 100k iterations). */
+async function deriveProtectorFromPhraseLegacy(mnemonic: string): Promise<AesGcmKey> {
   const seed = await bip39.mnemonicToSeed(mnemonic);
   const password = new Uint8Array(seed.slice(0, 32)) as PlaintextBytes;
   const salt = new TextEncoder().encode("LetUsMeet-Recovery-Salt-v1") as PlaintextBytes;

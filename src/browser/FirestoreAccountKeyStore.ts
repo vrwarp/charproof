@@ -77,6 +77,22 @@ export class FirestoreAccountKeyStore implements AccountKeyStore {
     await withRetry(() => setDoc(ref, docVal));
   }
 
+  async createAccountKeys(docVal: AccountKeysDocument): Promise<boolean> {
+    const uid = this.getUid();
+    const ref = doc(getDb(), "users", uid, "account_keys", "default");
+    return withRetry(() =>
+      runTransaction(getDb(), async (transaction) => {
+        const snap = await transaction.get(ref);
+        if (snap.exists()) {
+          // Another genesis already created the document; do not overwrite it.
+          return false;
+        }
+        transaction.set(ref, docVal);
+        return true;
+      })
+    );
+  }
+
   async getKeystoreEntry(ledgerId: string): Promise<KeystoreEntry | null> {
     const uid = this.getUid();
     const ref = doc(getDb(), "users", uid, "keystore", ledgerId);
@@ -226,10 +242,19 @@ export class FirestoreAccountKeyStore implements AccountKeyStore {
   async resetRemoteStore(): Promise<void> {
     const uid = this.getUid();
     const keystoreRef = collection(getDb(), "users", uid, "keystore");
-    const snap = await getDocs(keystoreRef);
-    const batch = writeBatch(getDb());
-    snap.docs.forEach(d => batch.delete(d.ref));
-    batch.delete(doc(getDb(), "users", uid, "account_keys", "default"));
-    await withRetry(() => batch.commit());
+    const snap = await withRetry(() => getDocs(keystoreRef));
+
+    // Firestore caps a WriteBatch at 500 operations. Chunk deletes so accounts
+    // with many keystore entries don't blow past the limit and throw.
+    const BATCH_LIMIT = 450;
+    const refs = snap.docs.map(d => d.ref);
+    refs.push(doc(getDb(), "users", uid, "account_keys", "default"));
+
+    for (let i = 0; i < refs.length; i += BATCH_LIMIT) {
+      const chunk = refs.slice(i, i + BATCH_LIMIT);
+      const batch = writeBatch(getDb());
+      chunk.forEach(ref => batch.delete(ref));
+      await withRetry(() => batch.commit());
+    }
   }
 }

@@ -6,40 +6,67 @@ import {
   query,
   orderBy,
   getDocs,
+  getDoc,
   limit,
   serverTimestamp,
-  getDoc,
   writeBatch
 } from "firebase/firestore";
 import { getDb } from "../config";
 import type { LedgerEventStore } from "../core/interfaces";
 import { withRetry } from "../core/retry";
+import { base64ToUint8, uint8ToBase64 } from "../core/base64";
+
+const CHAFF_POOL_CACHE_KEY = "charproof_chaff_pool";
 
 function generateId(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
   return Math.random().toString(36).substring(2, 15);
 }
 
-function generateRealisticDecoy(encLength: number, ivLength: number): { encryptedData: string; iv: string } {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
-  let encryptedData = "";
-  let iv = "";
-  for (let i = 0; i < encLength; i++) {
-    encryptedData += chars.charAt(Math.floor(Math.random() * chars.length));
+function getRandomBytes(length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < length; i++) bytes[i] = Math.floor(Math.random() * 256);
   }
-  for (let i = 0; i < ivLength; i++) {
-    iv += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return { encryptedData, iv };
+  return bytes;
+}
+
+/**
+ * Produces a decoy payload that is byte-for-byte indistinguishable from a real
+ * AES-GCM payload: cryptographically-random bytes, base64-encoded, with the SAME
+ * decoded length (hence identical encoded length and padding) as the real one.
+ *
+ * This matters for plausible deniability — the previous implementation sampled
+ * uniform characters from the base64 alphabet (with `=` at arbitrary positions),
+ * which a snapshot adversary could trivially classify and discard as malformed,
+ * collapsing the deniability the chaff is supposed to provide.
+ */
+function generateIndistinguishableDecoy(
+  realEncryptedData: string,
+  realIv: string
+): { encryptedData: string; iv: string } {
+  const encLen = base64ToUint8(realEncryptedData).length;
+  const ivLen = base64ToUint8(realIv).length;
+  return {
+    encryptedData: uint8ToBase64(getRandomBytes(encLen)),
+    iv: uint8ToBase64(getRandomBytes(ivLen))
+  };
 }
 
 export class FirestoreLedgerEventStore implements LedgerEventStore {
+  private readonly decoyCount: number;
+
+  constructor(options?: { decoyCount?: number }) {
+    this.decoyCount = options?.decoyCount ?? 3;
+  }
+
   async appendEvent(ledgerId: string, eventId: string, data: { encryptedData: string; iv: string }): Promise<void> {
     const db = getDb();
     const batch = writeBatch(db);
-    const X = 3; // Configurable number of decoy writes
 
-    // 1. Queue the legitimate event write
+    // 1. Queue the legitimate event write.
     const realRef = doc(db, "polls", ledgerId, "events", eventId);
     batch.set(realRef, {
       eventId,
@@ -48,76 +75,55 @@ export class FirestoreLedgerEventStore implements LedgerEventStore {
       iv: data.iv
     });
 
+    // 2. Add decoy writes into OTHER active ledgers, masking both which ledger
+    //    really changed and its event count/timing. The pool of active ledger
+    //    IDs is maintained server-side (a scheduled function); clients only read
+    //    it. Decoy payloads are indistinguishable from real ciphertext.
+    let activePolls: string[] = [];
     try {
-      // 2. Fetch the current chaff pool
       const poolSnap = await getDoc(doc(db, "chaff_pool", "current"));
-      let activePolls: string[] = [];
-
       if (poolSnap.exists()) {
         activePolls = poolSnap.data().activePollIds || [];
         try {
-          localStorage.setItem("charproof_chaff_pool", JSON.stringify(activePolls));
+          localStorage.setItem(CHAFF_POOL_CACHE_KEY, JSON.stringify(activePolls));
         } catch (e) {
-          // Safe fallback for private browsing or full storage
-        }
-      }
-
-      if (activePolls.length > 0) {
-        // Exclude our own ledgerId to avoid writing self-chaff
-        const candidates = activePolls.filter(id => id !== ledgerId);
-        
-        // Randomly select up to X candidate IDs
-        const selectedChaffIds = candidates
-          .sort(() => 0.5 - Math.random())
-          .slice(0, X);
-
-        // 3. Queue the decoy chaff writes
-        for (const chaffId of selectedChaffIds) {
-          const decoyEventId = generateId();
-          const decoyRef = doc(db, "polls", chaffId, "events", decoyEventId);
-          
-          // Generate realistic decoy payload matching character lengths of original data
-          const decoyPayload = generateRealisticDecoy(data.encryptedData.length, data.iv.length);
-          
-          batch.set(decoyRef, {
-            eventId: decoyEventId,
-            createdAt: serverTimestamp(),
-            encryptedData: decoyPayload.encryptedData,
-            iv: decoyPayload.iv
-          });
+          // Private browsing / storage full — non-fatal.
         }
       }
     } catch (err) {
-      // Try local storage fallback before giving up on chaff generation
+      // Network failure — fall back to the last cached pool so chaff still flows.
       console.warn("Failed to fetch chaff pool from network. Attempting local storage cache fallback...", err);
       try {
-        const cachedPoolStr = localStorage.getItem("charproof_chaff_pool");
-        if (cachedPoolStr) {
-          const cachedPolls: string[] = JSON.parse(cachedPoolStr) || [];
-          const candidates = cachedPolls.filter(id => id !== ledgerId);
-          const selectedChaffIds = candidates
-            .sort(() => 0.5 - Math.random())
-            .slice(0, X);
-
-          for (const chaffId of selectedChaffIds) {
-            const decoyEventId = generateId();
-            const decoyRef = doc(db, "polls", chaffId, "events", decoyEventId);
-            const decoyPayload = generateRealisticDecoy(data.encryptedData.length, data.iv.length);
-            
-            batch.set(decoyRef, {
-              eventId: decoyEventId,
-              createdAt: serverTimestamp(),
-              encryptedData: decoyPayload.encryptedData,
-              iv: decoyPayload.iv
-            });
-          }
-        }
+        const cached = localStorage.getItem(CHAFF_POOL_CACHE_KEY);
+        if (cached) activePolls = JSON.parse(cached) || [];
       } catch (cacheErr) {
         console.error("Local chaff pool cache fallback failed:", cacheErr);
       }
     }
 
-    // 4. Commit all writes simultaneously in a single network request (with retry)
+    // The decoys are added to the batch ONCE, before commit, so a transient-error
+    // retry replays the same batch rather than spraying fresh decoys each attempt.
+    const candidates = activePolls.filter(id => id !== ledgerId);
+    if (candidates.length > 0 && this.decoyCount > 0) {
+      const selected = candidates
+        .slice()
+        .sort(() => 0.5 - Math.random())
+        .slice(0, this.decoyCount);
+
+      for (const chaffId of selected) {
+        const decoyEventId = generateId();
+        const decoyRef = doc(db, "polls", chaffId, "events", decoyEventId);
+        const decoyPayload = generateIndistinguishableDecoy(data.encryptedData, data.iv);
+        batch.set(decoyRef, {
+          eventId: decoyEventId,
+          createdAt: serverTimestamp(),
+          encryptedData: decoyPayload.encryptedData,
+          iv: decoyPayload.iv
+        });
+      }
+    }
+
+    // 3. Commit all writes atomically (with transient-error retry).
     await withRetry(() => batch.commit());
   }
 
@@ -161,7 +167,7 @@ export class FirestoreLedgerEventStore implements LedgerEventStore {
 
   async createLedger(ledgerId: string): Promise<void> {
     const ref = doc(getDb(), "polls", ledgerId);
-    await withRetry(() => setDoc(ref, { 
+    await withRetry(() => setDoc(ref, {
       pollId: ledgerId,
       createdAt: serverTimestamp()
     }));

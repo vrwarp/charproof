@@ -37,6 +37,25 @@ Run the full Vitest suite (includes unit, integration, and fuzz/concurrency chec
 npm test
 ```
 
+## Security
+
+Charproof's zero-knowledge guarantees depend on how you deploy it. Before going
+to production, read [`SECURITY.md`](./SECURITY.md) and deploy the bundled
+[`firestore.rules`](./firestore.rules). In short, you must:
+
+- **Deploy the Firestore security rules** — they enforce per-user isolation and
+  append-only, immutable event logs. The guarantees do not hold without them.
+- **Set an authorized-signer allowlist** for multi-writer ledgers
+  (`session.setAuthorizedSigners(...)`), otherwise any holder of the shared key
+  can impersonate another author.
+- **Verify devices out-of-band** at enrollment using the 6-digit code
+  (`getLocalVerificationCode()` / `approveDeviceAuthorization(d, { expectedVerificationCode })`).
+- Understand that **device revocation is forward-only** — it cannot claw back
+  data a revoked device already decrypted.
+
+There is no runtime mock/plaintext-crypto switch; the production crypto provider
+is WebCrypto unless you explicitly inject one via `initializeZK({ db, auth, cryptoProvider })`.
+
 ## Developer & API Guide
 
 Charproof provides a comprehensive API for bootstrapping a zero-knowledge context, managing secondary devices, encrypting transaction logs, and setting up hardware/phrase-based recovery.
