@@ -16,9 +16,22 @@ import {
   verifyAmk,
   requestDeviceAuthorization,
   approveDeviceAuthorization,
+  getVerificationCodeForPublicKey,
+  getLocalVerificationCode,
+  setupPhraseRecovery,
+  recoverAmkWithPhrase,
+  setRecoveryProviders,
   setDeviceName,
   getDeviceName
 } from "../../index";
+import {
+  getCrypto,
+  encrypt,
+  encryptPayload,
+  wrapAmk,
+  exportDevicePublicKey
+} from "../../core/crypto";
+import * as bip39 from "bip39";
 import {
   DeterministicCryptoProvider,
   MockAccountKeyStore,
@@ -26,7 +39,7 @@ import {
   MockAuthProvider,
   MockPrfProvider
 } from "./DeterministicMocks";
-import type { PendingDevice } from "../../core/types";
+import type { AccountKeysDocument, PendingDevice } from "../../core/types";
 
 describe("deviceService Integration Tests", () => {
   let cryptoProvider: DeterministicCryptoProvider;
@@ -50,6 +63,7 @@ describe("deviceService Integration Tests", () => {
     setCryptoProvider(cryptoProvider);
     setDeviceServiceProviders({ accountKeyStore, localDeviceStore, authProvider });
     setPrfProviders({ localDeviceStore, authProvider, prfProvider });
+    setRecoveryProviders({ accountKeyStore, authProvider });
     resetAllCaches();
 
     // Default setup: signed in user
@@ -331,5 +345,165 @@ describe("deviceService Integration Tests", () => {
     for (const res of results) {
       expect(res.amkId).toBe(results[0].amkId);
     }
+  });
+
+  test("approveDeviceAuthorization enforces a matching verification code", async () => {
+    // Genesis on Device A
+    await getActiveAmk();
+
+    // Device B requests authorization
+    const devB_Store = new MockLocalDeviceStore("device-b", "Alice's iPhone");
+    setDeviceServiceProviders({ accountKeyStore, localDeviceStore: devB_Store, authProvider });
+    resetAllCaches();
+    await requestDeviceAuthorization();
+    const pending = await accountKeyStore.getPendingDevice("device-b");
+    expect(pending).not.toBeNull();
+
+    // Back to Device A to approve
+    setDeviceServiceProviders({ accountKeyStore, localDeviceStore, authProvider });
+    resetAllCaches();
+
+    // Wrong code is rejected and does NOT authorize the device.
+    await expect(
+      approveDeviceAuthorization(pending!, { expectedVerificationCode: "000000" })
+    ).rejects.toThrow("VERIFICATION_CODE_MISMATCH");
+
+    let doc = await accountKeyStore.getAccountKeys();
+    expect(doc!.devices["device-b"]).toBeUndefined();
+
+    // Correct code (derived from the pending device's public key) succeeds.
+    const correctCode = await getVerificationCodeForPublicKey(pending!.publicKey);
+    await approveDeviceAuthorization(pending!, { expectedVerificationCode: correctCode });
+
+    doc = await accountKeyStore.getAccountKeys();
+    expect(doc!.devices["device-b"]).toBeDefined();
+  });
+
+  test("getLocalVerificationCode matches the code computed from the device's public key", async () => {
+    await getActiveAmk();
+    const localKeys = await localDeviceStore.loadDeviceKeys();
+    expect(localKeys).not.toBeNull();
+
+    const fromLocal = await getLocalVerificationCode();
+    const fromPub = await getVerificationCodeForPublicKey(localKeys!.publicKey);
+    expect(fromLocal).toBe(fromPub);
+    expect(fromLocal).toMatch(/^\d{6}$/);
+  });
+
+  test("Genesis lost-race: recovers from the winning document without clobbering keys", async () => {
+    // First, perform a normal genesis on Device A so a valid document + device
+    // keys exist (the "winner").
+    const winning = await getActiveAmk();
+    const winningKeys = await localDeviceStore.loadDeviceKeys();
+    expect(winningKeys).not.toBeNull();
+
+    // A store that reports "no document" on the next getAccountKeys() (simulating
+    // the read that precedes genesis) but still rejects the create as a loser.
+    let raceArmed = true;
+    const raceyStore = Object.create(accountKeyStore) as MockAccountKeyStore;
+    raceyStore.getAccountKeys = async () => {
+      if (raceArmed) {
+        raceArmed = false;
+        return null; // pretend the account doesn't exist yet → drives genesis path
+      }
+      return accountKeyStore.getAccountKeys();
+    };
+    raceyStore.createAccountKeys = async () => false; // we always lose the race
+
+    setDeviceServiceProviders({ accountKeyStore: raceyStore, localDeviceStore, authProvider });
+    resetAllCaches();
+
+    const recovered = await getActiveAmk();
+    expect(recovered.amkId).toBe(winning.amkId);
+
+    // The winner's device keys must be intact (not clobbered by the loser).
+    const keysAfter = await localDeviceStore.loadDeviceKeys();
+    expect(keysAfter).toEqual(winningKeys);
+  });
+
+  test("Genesis lost-race with fresh keys fails cleanly without clobbering IndexedDB", async () => {
+    // Winner: normal genesis on Device A; its keys live in `localDeviceStore`.
+    await getActiveAmk();
+
+    // Loser: a second tab on the same device id but a DIFFERENT, empty local
+    // store, so it generates fresh keys that do NOT match the winning document.
+    const loserStore = new MockLocalDeviceStore("device-a", "Alice's Mac (tab 2)");
+
+    let raceArmed = true;
+    const raceyStore = Object.create(accountKeyStore) as MockAccountKeyStore;
+    raceyStore.getAccountKeys = async () => {
+      if (raceArmed) {
+        raceArmed = false;
+        return null; // drive the genesis path
+      }
+      return accountKeyStore.getAccountKeys(); // winning doc on the retry read
+    };
+    raceyStore.createAccountKeys = async () => false; // always lose the race
+
+    setDeviceServiceProviders({ accountKeyStore: raceyStore, localDeviceStore: loserStore, authProvider });
+    setPrfProviders({ localDeviceStore: loserStore, authProvider, prfProvider });
+    resetAllCaches();
+
+    await expect(getActiveAmk()).rejects.toThrow("UNRECOGNIZED_DEVICE");
+
+    // The loser must NOT have persisted its freshly-generated keys — doing so
+    // would clobber the winning device's keys in shared IndexedDB.
+    expect(await loserStore.loadDeviceKeys()).toBeNull();
+  });
+
+  test("Phrase recovery round-trips the AMK (random per-record salt path)", async () => {
+    const { amk } = await getActiveAmk();
+    const expectedRaw = await getCrypto().exportSymmetricKey(amk);
+
+    const mnemonic = await setupPhraseRecovery();
+    expect(mnemonic.split(" ").length).toBe(24);
+
+    // The stored entry must carry a per-record salt (not a hardcoded constant).
+    const doc = await accountKeyStore.getAccountKeys();
+    const entry = JSON.parse((doc!.recoveryMethods["__recovery_phrase"] as any).encryptedPrivateKey);
+    expect(typeof entry.kdfSalt).toBe("string");
+    expect(entry.kdfSalt.length).toBeGreaterThan(0);
+
+    const recovered = await recoverAmkWithPhrase(mnemonic);
+    const recoveredRaw = await getCrypto().exportSymmetricKey(recovered.amk);
+    expect(new Uint8Array(recoveredRaw)).toEqual(new Uint8Array(expectedRaw));
+  });
+
+  test("Phrase recovery falls back to legacy derivation for pre-salt entries", async () => {
+    const { amk, amkId } = await getActiveAmk();
+    const expectedRaw = await getCrypto().exportSymmetricKey(amk);
+
+    // Reconstruct a LEGACY phrase-recovery entry exactly as the pre-change code
+    // wrote it: constant salt, 100k iterations, and NO kdfSalt field.
+    const mnemonic = bip39.generateMnemonic(256);
+    const seed = await bip39.mnemonicToSeed(mnemonic);
+    const password = new Uint8Array(seed.slice(0, 32)) as any;
+    const legacySalt = new TextEncoder().encode("LetUsMeet-Recovery-Salt-v1") as any;
+    const protector = (await getCrypto().deriveKeyFromPassword(password, legacySalt, 100000)) as any;
+
+    const rsaPair = await getCrypto().generateDeviceKeyPair();
+    const privRaw = await getCrypto().exportDevicePrivateKey(rsaPair.privateKey);
+    const privB64 = btoa(String.fromCharCode(...new Uint8Array(privRaw)));
+    const { ciphertext, iv } = await encrypt(protector, privB64);
+
+    const rawAmk = await getCrypto().exportSymmetricKey(amk);
+    const wrappedAmk = await wrapAmk(rsaPair.publicKey, rawAmk.buffer as ArrayBuffer);
+    const pubB64 = await exportDevicePublicKey(rsaPair.publicKey);
+
+    const doc = await accountKeyStore.getAccountKeys() as AccountKeysDocument;
+    doc.recoveryMethods["__recovery_phrase"] = {
+      type: "phrase",
+      encryptedLabel: await encryptPayload(amk, "Primary Recovery Phrase"),
+      publicKey: pubB64,
+      createdAt: Date.now()
+    };
+    // Legacy format: ciphertext + iv only, no kdfSalt/kdfIterations.
+    (doc.recoveryMethods["__recovery_phrase"] as any).encryptedPrivateKey = JSON.stringify({ ciphertext, iv });
+    doc.keyring[amkId]["__recovery_phrase"] = wrappedAmk;
+    await accountKeyStore.setAccountKeys(doc);
+
+    const recovered = await recoverAmkWithPhrase(mnemonic);
+    const recoveredRaw = await getCrypto().exportSymmetricKey(recovered.amk);
+    expect(new Uint8Array(recoveredRaw)).toEqual(new Uint8Array(expectedRaw));
   });
 });

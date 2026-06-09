@@ -373,18 +373,20 @@ async function setupGenesisDevice(uid: string): Promise<{ amk: AesGcmKey, amkId:
   const created = await store.createAccountKeys(doc);
 
   if (!created) {
-    // We lost the genesis race. Persist our just-generated keys (so a retry is
-    // idempotent), then recover the AMK from the winning document using whatever
-    // device keys are now registered for this device.
-    await local.saveDeviceKeys({ privateKey: privB64, publicKey: pubB64 });
-
+    // We lost the genesis race (another tab/device created the document first).
+    // Do NOT persist our freshly-generated keys: in shared IndexedDB that would
+    // clobber the winning device's keys and lock it out. Instead, recover the
+    // AMK from the winning document using whatever keys are already registered
+    // for this device (the winner's, if this is the same device).
     const winningDoc = await store.getAccountKeys();
     if (!winningDoc) {
-      throw new Error("Genesis race lost but no account document is present; retry.");
+      const err = new Error("Genesis race lost but no account document is present; retry.");
+      (err as any).retryable = true;
+      throw err;
     }
     const winningAmkId = winningDoc.activeAmkId;
     const deviceKeys = await local.loadDeviceKeys();
-    const wrapped = winningDoc.keyring[winningAmkId]?.[deviceId];
+    const wrapped = deviceKeys ? winningDoc.keyring[winningAmkId]?.[deviceId] : undefined;
     if (!wrapped || !deviceKeys) {
       const err = new Error(
         "UNRECOGNIZED_DEVICE: A concurrent genesis created the account with different keys. " +

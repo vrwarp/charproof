@@ -210,6 +210,34 @@ describe("Resilience and Safe Degradation", () => {
     });
   });
 
+  describe("FirestoreAccountKeyStore - resetRemoteStore batch chunking", () => {
+    it("splits deletes into multiple batches under the 500-op limit", async () => {
+      const store = new FirestoreAccountKeyStore();
+
+      // 1000 keystore docs + 1 account doc = 1001 deletes → ceil(1001/450) = 3 batches.
+      const fakeDocs = Array.from({ length: 1000 }, (_, i) => ({ ref: { id: `doc-${i}` } }));
+      vi.mocked(firestore.getDocs).mockResolvedValue({ docs: fakeDocs } as any);
+
+      const batches: Array<{ delete: any; commit: any }> = [];
+      vi.mocked(firestore.writeBatch).mockImplementation(() => {
+        const b = { delete: vi.fn(), commit: vi.fn().mockResolvedValue(undefined) };
+        batches.push(b);
+        return b as any;
+      });
+
+      await store.resetRemoteStore();
+
+      expect(batches.length).toBe(3);
+      const totalDeletes = batches.reduce((sum, b) => sum + b.delete.mock.calls.length, 0);
+      expect(totalDeletes).toBe(1001);
+      // No batch may exceed Firestore's 500-op cap.
+      for (const b of batches) {
+        expect(b.delete.mock.calls.length).toBeLessThanOrEqual(500);
+        expect(b.commit).toHaveBeenCalledTimes(1);
+      }
+    });
+  });
+
   describe("Keystore onError listener propagation", () => {
     it("should pass onError callbacks through subscribeToUserKeystore", () => {
       const mockOnError = vi.fn();
