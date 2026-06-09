@@ -51,19 +51,6 @@ function generateId(): string {
   return Math.random().toString(36).substring(2, 15);
 }
 
-/**
- * Configures the set of the user's OWN ledger IDs eligible to receive decoy
- * (chaff) writes, hiding which ledger actually changed. Only the caller's own
- * writable ledgers may be passed — decoys are never written cross-tenant.
- * No-op if the active event store does not support decoys.
- */
-export function setLedgerDecoyPool(ledgerIds: string[]): void {
-  const maybe = eventStore as { setDecoyPool?: (ids: string[]) => void };
-  if (typeof maybe.setDecoyPool === "function") {
-    maybe.setDecoyPool(ledgerIds);
-  }
-}
-
 export class DefaultLedgerSession implements LedgerSession {
   private pendingOwnerRecovery: EncryptedData | null;
 

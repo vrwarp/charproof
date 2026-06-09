@@ -74,22 +74,35 @@ key. Revocation protects **future** data. If you need to deny access to existing
 data, you must additionally rotate the underlying ledger symmetric keys and
 re-share them with the remaining participants.
 
-## 5. Decoy (chaff) writes are tenant-local and opt-in
+## 5. Decoy (chaff) writes and plausible deniability
 
-Decoy writes (to obscure which ledger changed) are **disabled by default** and,
-when enabled, only target the **caller's own** ledgers:
+To give every ledger plausible deniability against an adversary who takes a
+one-off snapshot of the database, each real event write is accompanied by decoy
+("chaff") writes into **other active ledgers**. This masks both which ledger
+actually changed and its event count/timing. The pool of active ledger IDs lives
+in `chaff_pool/current`, which is **maintained server-side by a scheduled
+function** and is **read-only to clients** (see `firestore.rules`).
 
-```ts
-import { FirestoreLedgerEventStore, setSessionProviders, setLedgerDecoyPool } from 'charproof';
+Decoy payloads are now **byte-for-byte indistinguishable** from real AES-GCM
+output: cryptographically-random bytes, base64-encoded, with the same decoded
+length (and therefore identical encoded length and padding) as the real payload.
+The previous generator sampled uniform base64 characters (with `=` at arbitrary
+positions), which a snapshot adversary could classify and discard as malformed —
+defeating the deniability. That flaw is fixed.
 
-setSessionProviders({ ledgerEventStore: new FirestoreLedgerEventStore({ decoyPool: myLedgerIds }) });
-// or update dynamically:
-setLedgerDecoyPool(myLedgerIds);
-```
+What this does and does not protect:
 
-The previous implementation wrote decoys into a globally-shared pool of *other
-users'* ledgers, which leaked the active-ledger set and required permissive
-cross-tenant write rules. That behavior has been removed.
+- **Confidentiality** rests on the per-ledger symmetric key, not on secrecy of
+  ledger IDs. A decoy (or anyone without the key) cannot read event contents.
+- **Integrity**: a decoy cannot forge a *valid* event — that requires the
+  symmetric key plus a signature from an authorized signer (§2). Invalid events
+  are filtered client-side during decryption/validation.
+- **Trade-off**: events are append-only and immutable, so chaff (legitimate or
+  malicious) accumulates permanently and is re-synced by every participant.
+  Knowing live ledger IDs also enables targeted write-flooding. Bound this with
+  pagination / capped reads and (optionally) per-user write quotas.
+- Tune the number of decoys per write via
+  `new FirestoreLedgerEventStore({ decoyCount })` (default 3).
 
 ## 6. Key-derivation hardening (migration notes)
 

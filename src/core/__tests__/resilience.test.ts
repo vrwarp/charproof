@@ -3,6 +3,7 @@ import { BrowserLocalDeviceStore } from "../../browser/BrowserLocalDeviceStore";
 import { FirestoreAccountKeyStore } from "../../browser/FirestoreAccountKeyStore";
 import { FirestoreLedgerEventStore } from "../../browser/FirestoreLedgerEventStore";
 import { subscribeToUserKeystore } from "../../deviceService";
+import { base64ToUint8 } from "../base64";
 import * as idb from "../../idb";
 import * as firestore from "firebase/firestore";
 
@@ -73,9 +74,17 @@ describe("Resilience and Safe Degradation", () => {
     });
   });
 
-  describe("FirestoreLedgerEventStore - Tenant-Local Decoy Chaff", () => {
-    it("writes only the real event when no decoy pool is configured", async () => {
+  describe("FirestoreLedgerEventStore - ZK Decoy Chaff", () => {
+    it("should cache chaff pool IDs on success, and use them on network failure", async () => {
       const store = new FirestoreLedgerEventStore();
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      // 1. Success Path - Cache active poll IDs
+      const mockSnapshot = {
+        exists: () => true,
+        data: () => ({ activePollIds: ["poll-a", "poll-b"] }),
+      };
+      vi.mocked(firestore.getDoc).mockResolvedValue(mockSnapshot as any);
 
       const batchMock = {
         set: vi.fn(),
@@ -83,46 +92,58 @@ describe("Resilience and Safe Degradation", () => {
       };
       vi.mocked(firestore.writeBatch).mockReturnValue(batchMock as any);
 
-      await store.appendEvent("my-ledger", "event-123", { encryptedData: "enc", iv: "iv" });
+      // Use valid base64 payloads so decoy length/format can be compared.
+      const realData = { encryptedData: btoa("a realistic ciphertext blob!!"), iv: btoa("123456789012") };
+      await store.appendEvent("my-ledger", "event-123", realData);
 
-      // Exactly one write (the real event) — no decoys, no cross-tenant writes.
-      expect(batchMock.set).toHaveBeenCalledTimes(1);
-      expect(batchMock.commit).toHaveBeenCalledTimes(1);
-      // It must NOT read any global chaff pool document.
-      expect(firestore.getDoc).not.toHaveBeenCalled();
-    });
+      // Verify cached in localStorage
+      expect(localStorage.getItem("charproof_chaff_pool")).toBe(JSON.stringify(["poll-a", "poll-b"]));
 
-    it("writes decoys only into the user's own configured ledgers, never foreign ones", async () => {
-      const store = new FirestoreLedgerEventStore({ decoyPool: ["mine-a", "mine-b", "mine-c"], decoyCount: 2 });
-
-      const batchMock = {
-        set: vi.fn(),
-        commit: vi.fn().mockResolvedValue(undefined),
-      };
-      vi.mocked(firestore.writeBatch).mockReturnValue(batchMock as any);
-
-      // Track which (collection) paths were targeted via the doc() mock.
-      vi.mocked(firestore.doc).mockImplementation((...args: any[]) => ({ path: args.join("/") }) as any);
-
-      await store.appendEvent("mine-a", "event-123", { encryptedData: "enc", iv: "iv" });
-
-      // 1 real + 2 decoys = 3 writes.
+      // 1 real + 2 decoys (pool minus self) = 3 writes
       expect(batchMock.set).toHaveBeenCalledTimes(3);
 
-      // Every targeted ledger must be one of the user's own ledgers — never a foreign poll.
-      const targetedLedgers = batchMock.set.mock.calls.map((call) => {
-        const path: string = call[0].path; // e.g. "<db>/polls/<ledgerId>/events/<eventId>"
-        const m = path.match(/polls\/([^/]+)\/events/);
-        return m ? m[1] : null;
-      });
-      for (const ledger of targetedLedgers) {
-        expect(["mine-a", "mine-b", "mine-c"]).toContain(ledger);
-      }
-      // The decoys must not target the real ledger itself.
-      const decoyLedgers = targetedLedgers.filter((l) => l !== "mine-a");
-      expect(decoyLedgers.length).toBe(2);
-      for (const ledger of decoyLedgers) {
-        expect(["mine-b", "mine-c"]).toContain(ledger);
+      // 2. Failure Path - Fallback to cache
+      vi.mocked(firestore.getDoc).mockRejectedValue(new Error("Network Down"));
+      await store.appendEvent("my-ledger", "event-456", realData);
+      expect(warnSpy.mock.calls[0][0]).toContain(
+        "Failed to fetch chaff pool from network. Attempting local storage cache fallback..."
+      );
+
+      warnSpy.mockRestore();
+    });
+
+    it("produces decoys indistinguishable from real payloads (valid base64, matching length)", async () => {
+      const store = new FirestoreLedgerEventStore({ decoyCount: 2 });
+
+      vi.mocked(firestore.getDoc).mockResolvedValue({
+        exists: () => true,
+        data: () => ({ activePollIds: ["poll-a", "poll-b", "poll-c"] }),
+      } as any);
+
+      const batchMock = { set: vi.fn(), commit: vi.fn().mockResolvedValue(undefined) };
+      vi.mocked(firestore.writeBatch).mockReturnValue(batchMock as any);
+
+      const realData = { encryptedData: btoa("the genuine encrypted ciphertext payload"), iv: btoa("abcdefghijkl") };
+      await store.appendEvent("real-ledger", "event-1", realData);
+
+      const base64Pattern = /^[A-Za-z0-9+/]*={0,2}$/;
+      const realEncLen = base64ToUint8(realData.encryptedData).length;
+      const realIvLen = base64ToUint8(realData.iv).length;
+
+      const decoyWrites = batchMock.set.mock.calls
+        .map((call) => call[1])
+        .filter((payload) => payload.eventId !== "event-1");
+
+      expect(decoyWrites.length).toBe(2);
+      for (const decoy of decoyWrites) {
+        // Well-formed base64 with padding only at the end (the old generator failed this).
+        expect(decoy.encryptedData).toMatch(base64Pattern);
+        expect(decoy.iv).toMatch(base64Pattern);
+        // Same decoded length as the real payload → identical on-disk footprint.
+        expect(base64ToUint8(decoy.encryptedData).length).toBe(realEncLen);
+        expect(base64ToUint8(decoy.iv).length).toBe(realIvLen);
+        // Not a copy of the real ciphertext.
+        expect(decoy.encryptedData).not.toBe(realData.encryptedData);
       }
     });
 

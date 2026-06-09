@@ -103,12 +103,5 @@ export {
   DefaultLedgerSession,
   createLedgerSession,
   getLedgerSession,
-  setSessionProviders,
-  setLedgerDecoyPool
+  setSessionProviders
 } from "./session";
-
-// Ledger event store (export so apps can inject a decoy-configured instance)
-export {
-  FirestoreLedgerEventStore,
-  type LedgerEventStoreOptions
-} from "./browser/FirestoreLedgerEventStore";

@@ -17,9 +17,14 @@ rules_version = '2';
 //    or other clients. Authorship is authenticated client-side via the
 //    authorized-signers allowlist (see SECURITY.md) — Firestore cannot verify
 //    signatures, so do NOT rely on these rules for authorship.
-//  * There is deliberately NO global "chaff pool" document and NO cross-tenant
-//    write path. Decoy writes are tenant-local (a user writing into their own
-//    ledgers), which is covered by the same append-only event rule.
+//  * Plausible-deniability chaff: clients append indistinguishable decoy events
+//    into other active ledgers (listed in `chaff_pool/current`, which is
+//    maintained server-side by a scheduled function and is read-only to clients).
+//    This is why event creation is intentionally open to any signed-in user.
+//    Decoys cannot forge a VALID event (that needs the per-ledger symmetric key
+//    + a signature from an authorized signer), so they are filtered client-side;
+//    they only add cover traffic. Trade-off: events are immutable, so decoys
+//    accumulate and cannot be pruned — size your sync/pagination accordingly.
 
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -31,6 +36,14 @@ service cloud.firestore {
     // ── Per-user zero-knowledge key material (owner-only) ──────────────
     match /users/{uid}/{document=**} {
       allow read, write: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    // ── Chaff pool (active ledger IDs for decoy traffic) ───────────────
+    // Read-only to clients; written only by a trusted scheduled function via the
+    // Admin SDK, which bypasses these rules.
+    match /chaff_pool/{docId} {
+      allow read: if isSignedIn();
+      allow write: if false;
     }
 
     // ── Shared, link-accessible ledgers ────────────────────────────────
