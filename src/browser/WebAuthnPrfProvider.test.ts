@@ -45,7 +45,7 @@ describe("WebAuthnPrfProvider", () => {
     vi.unstubAllGlobals();
   });
 
-  test("create() that yields PRF at creation time does not call get(); default UV is 'preferred'", async () => {
+  test("create() that yields PRF at creation time does not call get(); default UV is 'discouraged'", async () => {
     const prf = new Uint8Array(32).fill(7);
     createImpl = () => ({
       rawId: rawId("cred-1"),
@@ -56,7 +56,7 @@ describe("WebAuthnPrfProvider", () => {
     const res = await provider.createCredential("uid", "name", "display");
 
     expect(getCalls.length).toBe(0);
-    expect(createCalls[0].publicKey.authenticatorSelection.userVerification).toBe("preferred");
+    expect(createCalls[0].publicKey.authenticatorSelection.userVerification).toBe("discouraged");
     expect(createCalls[0].publicKey.rp.name).toBe("LetUsMeet");
     expect(createCalls[0].publicKey.rp.id).toBeUndefined();
     expect(res.credentialId).toBe(b64("cred-1"));
@@ -82,7 +82,7 @@ describe("WebAuthnPrfProvider", () => {
     // authenticator could pick a different hmac-secret and derive a different key.
     const createUv = createCalls[0].publicKey.authenticatorSelection.userVerification;
     const getUv = getCalls[0].publicKey.userVerification;
-    expect(createUv).toBe("preferred");
+    expect(createUv).toBe("discouraged");
     expect(getUv).toBe(createUv);
     expect(res.credentialId).toBe(b64("cred-2"));
     expect(Array.from(res.prfResult)).toEqual(Array.from(getPrf));
@@ -120,7 +120,7 @@ describe("WebAuthnPrfProvider", () => {
     const res = await provider.getAssertion([b64("cred-x")]);
 
     expect(getCalls[0].publicKey.rpId).toBe("example.com");
-    expect(getCalls[0].publicKey.userVerification).toBe("preferred");
+    expect(getCalls[0].publicKey.userVerification).toBe("discouraged");
     expect(res.usedCredentialId).toBe(b64("used-cred"));
     expect(Array.from(res.prfResult)).toEqual(Array.from(prf));
   });
@@ -177,5 +177,67 @@ describe("WebAuthnPrfProvider", () => {
     expect(Array.from(new Uint8Array(getCalls[0].publicKey.extensions.prf.eval.first))).toEqual([
       1, 2, 3, 4, 5
     ]);
+  });
+
+  test("create() requests a discoverable credential by default (routes to GPM on Android)", async () => {
+    const prf = new Uint8Array(32).fill(2);
+    createImpl = () => ({
+      rawId: rawId("c"),
+      getClientExtensionResults: () => ({ prf: { results: { first: prf } } })
+    });
+
+    const provider = new WebAuthnPrfProvider();
+    await provider.createCredential("u", "n", "d");
+
+    const sel = createCalls[0].publicKey.authenticatorSelection;
+    expect(sel.residentKey).toBe("required");
+    expect(sel.requireResidentKey).toBe(true); // legacy alias
+    // No attachment restriction by default → resident-capable roaming keys still work.
+    expect(sel.authenticatorAttachment).toBeUndefined();
+  });
+
+  test("residentKey/authenticatorAttachment are configurable; 'preferred' clears the legacy alias", async () => {
+    const prf = new Uint8Array(32).fill(2);
+    createImpl = () => ({
+      rawId: rawId("c"),
+      getClientExtensionResults: () => ({ prf: { results: { first: prf } } })
+    });
+
+    const provider = new WebAuthnPrfProvider({
+      residentKey: "preferred",
+      authenticatorAttachment: "platform"
+    });
+    await provider.createCredential("u", "n", "d");
+
+    const sel = createCalls[0].publicKey.authenticatorSelection;
+    expect(sel.residentKey).toBe("preferred");
+    expect(sel.requireResidentKey).toBe(false);
+    expect(sel.authenticatorAttachment).toBe("platform");
+  });
+
+  test("get() carries no authenticatorSelection/residentKey (discoverability is creation-only)", async () => {
+    const prf = new Uint8Array(32).fill(2);
+    getImpl = () => ({
+      rawId: rawId("c"),
+      getClientExtensionResults: () => ({ prf: { results: { first: prf } } })
+    });
+
+    const provider = new WebAuthnPrfProvider();
+    await provider.getAssertion([b64("cred")]);
+
+    expect(getCalls[0].publicKey.authenticatorSelection).toBeUndefined();
+    expect(getCalls[0].publicKey.residentKey).toBeUndefined();
+  });
+
+  test("create() short-circuits to PrfUnavailableError when the authenticator reports prf.enabled === false", async () => {
+    createImpl = () => ({
+      rawId: rawId("no-prf"),
+      getClientExtensionResults: () => ({ prf: { enabled: false } })
+    });
+
+    const provider = new WebAuthnPrfProvider();
+    await expect(provider.createCredential("u", "n", "d")).rejects.toBeInstanceOf(PrfUnavailableError);
+    // Must NOT waste a follow-up assertion ceremony when PRF is explicitly unsupported.
+    expect(getCalls.length).toBe(0);
   });
 });

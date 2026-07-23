@@ -6,7 +6,9 @@ const DEFAULT_PRF_SALT = "LetUsMeet-PRF-Salt-v1";
 /** Default relying-party display name. Display-only (see WebAuthnPrfOptions). */
 const DEFAULT_RP_NAME = "LetUsMeet";
 /** Default user-verification posture. See WebAuthnPrfOptions.userVerification. */
-const DEFAULT_UV: UserVerificationRequirement = "preferred";
+const DEFAULT_UV: UserVerificationRequirement = "discouraged";
+/** Default discoverability. See WebAuthnPrfOptions.residentKey. */
+const DEFAULT_RESIDENT_KEY: ResidentKeyRequirement = "required";
 
 export interface WebAuthnPrfOptions {
   /**
@@ -42,24 +44,48 @@ export interface WebAuthnPrfOptions {
    * stable this is a single value used for both ceremonies — never a per-op
    * setting and never an escalation ladder.
    *
-   * Default "preferred": on platform authenticators (Android Google Password
-   * Manager, Touch ID, Windows Hello) UV is always performed, so PRF is
-   * provisioned/evaluated and the derived key is stable. Use "required" if you
-   * support roaming security keys that can skip UV — it forces uv=1 on every
-   * ceremony, guaranteeing key stability at the cost of failing UV-incapable
-   * authenticators. "discouraged" reproduces the legacy behavior and fails to
-   * yield PRF on Android GPM.
+   * Default "discouraged". UV level is NOT what gates PRF on Android — reaching
+   * Google Password Manager (via `residentKey`, below) is — and GPM performs user
+   * verification regardless of this hint, so "discouraged" yields full PRF on GPM
+   * while matching the value earlier versions derived (existing sealed credentials
+   * keep recovering unchanged).
    *
-   * FORWARD-COMPATIBILITY CAVEAT (roaming security keys only): "preferred" is
-   * non-deterministic — the authenticator decides whether to perform UV. On a
-   * platform authenticator that is always uv=1, so the key is stable. But on a
-   * roaming key that starts WITHOUT a PIN and later HAS one configured, the same
-   * "preferred" request can flip from uv=0 (CredRandomWithoutUV) at seal time to
-   * uv=1 (CredRandomWithUV) at recovery time, deriving a DIFFERENT key and
-   * silently breaking recovery. If your users may enroll PRF on roaming keys,
-   * pin "required" (deterministic uv=1) instead of relying on this default.
+   * FORWARD-COMPATIBILITY CAVEAT (roaming security keys only): no non-"required"
+   * value is deterministic — the authenticator decides whether to perform UV, and
+   * the derived key depends on that. On a platform authenticator (always uv=1)
+   * the key is stable. But on a roaming key whose UV capability changes between
+   * ceremonies (e.g. a PIN is added later), the uv bit — and therefore the
+   * derived key — can change and silently break recovery. If your users may
+   * enroll PRF on roaming keys, pin "required" (deterministic uv=1). Whatever you
+   * choose, it participates in key derivation: treat it as set-once.
    */
   userVerification?: UserVerificationRequirement;
+  /**
+   * Whether credential creation requests a discoverable (resident) credential.
+   *
+   * This is the DECIDING factor for reaching Google Password Manager on Android:
+   * without a resident-key request, Chrome treats create() as a legacy,
+   * non-discoverable (second-factor) request and routes it to the security-key
+   * chooser, so no GPM passkey — and therefore no hmac-secret/PRF — is ever
+   * created. Requesting a discoverable credential makes it a *passkey*, which GPM
+   * handles and which carries PRF. Default "required" (a PRF recovery credential
+   * is a passkey).
+   *
+   * Creation-only: `authenticatorSelection` fields do not affect get(), so this
+   * has no effect on recovery of already-sealed credentials.
+   */
+  residentKey?: ResidentKeyRequirement;
+  /**
+   * Restricts credential creation to a platform ("platform") or roaming
+   * ("cross-platform") authenticator.
+   *
+   * Default undefined (both allowed): a `residentKey` request alone already
+   * routes Android platform users to Google Password Manager, and leaving this
+   * unset keeps resident-capable roaming security keys usable as a recovery
+   * custodian. Set "platform" for the cleanest UX on platform-only deployments —
+   * note that it EXCLUDES roaming security keys. Creation-only.
+   */
+  authenticatorAttachment?: AuthenticatorAttachment;
 }
 
 /**
@@ -87,6 +113,8 @@ export class WebAuthnPrfProvider implements PrfProvider {
   private readonly rpId?: string;
   private readonly prfSalt: Uint8Array;
   private readonly userVerification: UserVerificationRequirement;
+  private readonly residentKey: ResidentKeyRequirement;
+  private readonly authenticatorAttachment?: AuthenticatorAttachment;
 
   constructor(options: WebAuthnPrfOptions = {}) {
     this.rpName = options.rpName ?? DEFAULT_RP_NAME;
@@ -98,6 +126,8 @@ export class WebAuthnPrfProvider implements PrfProvider {
           ? new TextEncoder().encode(options.prfSalt)
           : new Uint8Array(options.prfSalt);
     this.userVerification = options.userVerification ?? DEFAULT_UV;
+    this.residentKey = options.residentKey ?? DEFAULT_RESIDENT_KEY;
+    this.authenticatorAttachment = options.authenticatorAttachment;
   }
 
   /** Fresh PRF extension object each call — some UAs neuter the salt buffer, so
@@ -115,6 +145,19 @@ export class WebAuthnPrfProvider implements PrfProvider {
     const rp: PublicKeyCredentialRpEntity = { name: this.rpName };
     if (this.rpId) rp.id = this.rpId;
 
+    // Request a DISCOVERABLE (resident) credential so Android Chrome routes to
+    // Google Password Manager (a passkey) rather than the legacy security-key
+    // chooser — the latter never provisions hmac-secret/PRF. `requireResidentKey`
+    // is the legacy boolean alias for older user agents.
+    const authenticatorSelection: AuthenticatorSelectionCriteria = {
+      userVerification: this.userVerification,
+      residentKey: this.residentKey,
+      requireResidentKey: this.residentKey === "required"
+    };
+    if (this.authenticatorAttachment) {
+      authenticatorSelection.authenticatorAttachment = this.authenticatorAttachment;
+    }
+
     const createOptions: CredentialCreationOptions = {
       publicKey: {
         challenge,
@@ -128,7 +171,7 @@ export class WebAuthnPrfProvider implements PrfProvider {
           { alg: -7, type: "public-key" },
           { alg: -257, type: "public-key" }
         ],
-        authenticatorSelection: { userVerification: this.userVerification },
+        authenticatorSelection,
         extensions: this.prfExtension()
       }
     };
@@ -142,6 +185,13 @@ export class WebAuthnPrfProvider implements PrfProvider {
     if (results.prf && results.prf.results && results.prf.results.first) {
       const prfResult = new Uint8Array(results.prf.results.first);
       return { credentialId, prfResult };
+    }
+
+    // The authenticator explicitly reported it cannot do PRF. Surface it now
+    // rather than performing a pointless assertion ceremony that will also come
+    // back empty.
+    if (results.prf && results.prf.enabled === false) {
+      throw new PrfUnavailableError(this.userVerification, [credentialId]);
     }
 
     // Android / Google Password Manager returns `prf: { enabled: true }` with no
