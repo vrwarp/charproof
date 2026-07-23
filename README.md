@@ -86,34 +86,36 @@ initializeZK({
   db: getFirestore(),
   auth: getAuth(),
   prf: {
-    rpName: 'Acme Signing',          // display name in the OS passkey prompt (safe to change)
-    // rpId: 'acme.example',         // relying-party ID; leave unset to use the origin
-    // prfSalt: 'acme-prf-salt-v1',  // PRF evaluation salt
-    userVerification: 'preferred'    // default; use 'required' for roaming security keys
+    rpName: 'Acme Signing',            // display name in the OS passkey prompt (safe to change)
+    // rpId: 'acme.example',           // relying-party ID; leave unset to use the origin
+    // prfSalt: 'acme-prf-salt-v1',    // PRF evaluation salt
+    // userVerification: 'discouraged',// default; pin 'required' for roaming security keys
+    // residentKey: 'required',        // default; discoverable passkey (needed for Android GPM)
+    // authenticatorAttachment: 'platform' // optional: platform-only UX (excludes roaming keys)
   }
 });
 ```
 
+> **Android requires a discoverable credential.** `residentKey` defaults to
+> `'required'` so `create()` produces a **passkey** and Android Chrome routes it
+> to Google Password Manager (which carries PRF/`hmac-secret`). Without it, Chrome
+> falls back to the legacy security-key chooser and never provisions PRF. This is
+> a creation-only setting — it has no effect on recovering existing credentials.
+> Set `authenticatorAttachment: 'platform'` for the cleanest platform-only UX
+> (note: it excludes roaming security keys); leaving it unset keeps
+> resident-capable roaming keys usable.
+
 > **Set-once values.** `prfSalt`, `rpId`, and `userVerification` participate in
-> key derivation / credential scoping. The derived recovery key depends on the
-> salt **and** on whether user verification was performed, so changing any of
-> these after credentials exist can make previously-sealed data unrecoverable.
-> Pick them once per deployment. `userVerification: 'preferred'` is sufficient on
-> platform authenticators (Android Google Password Manager, Touch ID, Windows
-> Hello), which always perform user verification. **If your users may enroll PRF
-> recovery on roaming security keys, pin `'required'` instead:** `'preferred'`
-> lets the authenticator decide whether to verify, so a roaming key enrolled
-> without a PIN (uv=0) and later given one (uv=1) would derive a different key
-> and silently fail recovery. `'required'` forces uv=1 on every ceremony.
->
-> **Upgrading an existing deployment.** The default `userVerification` is now
-> `'preferred'` (it was effectively `'discouraged'` in earlier versions). New
-> deployments should keep the default. If you have users who **already** sealed
-> PRF (passkey) recovery under an earlier version, pin
-> `userVerification: 'discouraged'` to keep deriving the same key — otherwise a
-> credential that was evaluated without user verification will derive a different
-> key under `'preferred'` and fail to recover. This only affects PRF *recovery*
-> credentials; per-device keys and phrase recovery are unaffected.
+> key derivation / credential scoping — changing any of them after credentials
+> exist can make previously-sealed data unrecoverable, so pick them once per
+> deployment. The default `userVerification: 'discouraged'` matches the value
+> earlier versions derived (existing credentials keep recovering) and yields full
+> PRF on platform authenticators, which perform user verification regardless of
+> the hint. **If your users may enroll PRF recovery on roaming security keys, pin
+> `'required'` instead:** any non-`'required'` value lets the authenticator decide
+> whether to verify, so a roaming key enrolled without a PIN (uv=0) and later
+> given one (uv=1) would derive a different key and silently fail recovery.
+> `'required'` forces uv=1 on every ceremony.
 
 ### 2. Device Lifecycle and Key Management
 
