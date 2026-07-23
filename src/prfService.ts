@@ -1,7 +1,7 @@
 import type { AesGcmKey, LocalDeviceStore, AuthProvider, PrfProvider } from "./core/interfaces";
 import { BrowserLocalDeviceStore } from "./browser/BrowserLocalDeviceStore";
 import { FirebaseAuthProvider } from "./browser/FirebaseAuthProvider";
-import { WebAuthnPrfProvider } from "./browser/WebAuthnPrfProvider";
+import { WebAuthnPrfProvider, PrfUnavailableError } from "./browser/WebAuthnPrfProvider";
 import { getCrypto } from "./core/crypto";
 
 let local: LocalDeviceStore = new BrowserLocalDeviceStore();
@@ -74,8 +74,17 @@ export async function derivePrfMasterKey(credentialIds?: string[]): Promise<{ ma
       // Use the full 256 bits of PRF output (WebAuthn PRF `first` returns 32 bytes)
       // so the recovery key is as strong as the AES-256 AMK it protects. Previously
       // this truncated to 16 bytes (AES-128), making recovery the weakest link.
+      //
+      // A too-short result means this authenticator's PRF is unusable as a
+      // 256-bit custodian. Signal it as PrfUnavailable (typed) rather than a bare
+      // Error so genesis degrades to a device-key-only account instead of
+      // hard-blocking account creation — refusing the weak key WITHOUT locking
+      // the user out of sign-up.
       if (prfResult.length < 32) {
-        throw new Error(`PRF output too short (${prfResult.length} bytes); expected at least 32.`);
+        throw new PrfUnavailableError(
+          "preferred",
+          usedId ? [usedId] : [],
+        );
       }
       const masterKey = await getCrypto().importSymmetricKey(prfResult.slice(0, 32) as any);
 

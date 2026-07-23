@@ -55,6 +55,11 @@ export {
   loadMasterKeyFromIndexedDB,
   setPrfProviders
 } from "./prfService";
+export {
+  WebAuthnPrfProvider,
+  PrfUnavailableError,
+  type WebAuthnPrfOptions
+} from "./browser/WebAuthnPrfProvider";
 
 // Device Management, AMK and Keystore
 export {

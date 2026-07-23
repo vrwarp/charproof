@@ -76,6 +76,45 @@ initializeZK({
 });
 ```
 
+#### Configuring the WebAuthn PRF provider (optional)
+
+The built-in PRF provider is configurable via `initializeZK({ prf })` so downstream
+apps aren't tied to the default branding or verification posture:
+
+```typescript
+initializeZK({
+  db: getFirestore(),
+  auth: getAuth(),
+  prf: {
+    rpName: 'Acme Signing',          // display name in the OS passkey prompt (safe to change)
+    // rpId: 'acme.example',         // relying-party ID; leave unset to use the origin
+    // prfSalt: 'acme-prf-salt-v1',  // PRF evaluation salt
+    userVerification: 'preferred'    // default; use 'required' for roaming security keys
+  }
+});
+```
+
+> **Set-once values.** `prfSalt`, `rpId`, and `userVerification` participate in
+> key derivation / credential scoping. The derived recovery key depends on the
+> salt **and** on whether user verification was performed, so changing any of
+> these after credentials exist can make previously-sealed data unrecoverable.
+> Pick them once per deployment. `userVerification: 'preferred'` is sufficient on
+> platform authenticators (Android Google Password Manager, Touch ID, Windows
+> Hello), which always perform user verification. **If your users may enroll PRF
+> recovery on roaming security keys, pin `'required'` instead:** `'preferred'`
+> lets the authenticator decide whether to verify, so a roaming key enrolled
+> without a PIN (uv=0) and later given one (uv=1) would derive a different key
+> and silently fail recovery. `'required'` forces uv=1 on every ceremony.
+>
+> **Upgrading an existing deployment.** The default `userVerification` is now
+> `'preferred'` (it was effectively `'discouraged'` in earlier versions). New
+> deployments should keep the default. If you have users who **already** sealed
+> PRF (passkey) recovery under an earlier version, pin
+> `userVerification: 'discouraged'` to keep deriving the same key — otherwise a
+> credential that was evaluated without user verification will derive a different
+> key under `'preferred'` and fail to recover. This only affects PRF *recovery*
+> credentials; per-device keys and phrase recovery are unaffected.
+
 ### 2. Device Lifecycle and Key Management
 
 Every device enrolling in a user's ZK workspace maintains its own local key pairs (RSA-OAEP for key wrapping, ECDSA for signing) saved in IndexedDB.
@@ -151,6 +190,15 @@ const unsubscribe = session.subscribe((events) => {
 
 Enables users to safely backup their Account Master Key using a secure 24-word recovery phrase.
 
+> **Recovery is optional at account genesis.** Account creation binds a PRF
+> (passkey) recovery custodian when the authenticator supports it, but if PRF
+> cannot be provisioned the account is still created as a **device-key-only**
+> account so the user is never locked out of sign-up. Such an account has **no
+> recovery method** until one is sealed — detect this with
+> `getRecoveryStatus()` (`isSealed: false`) and prompt the user to run
+> `setupPhraseRecovery()` or `enablePrfRecovery()` right away, because clearing
+> local storage before a method exists is unrecoverable.
+
 #### Setting up Recovery Phrase
 ```typescript
 import { setupPhraseRecovery } from 'charproof';
@@ -164,7 +212,9 @@ console.log(`Write down your 24-word recovery phrase: "${phrase}"`);
 ```typescript
 import { recoverAmkWithPhrase } from 'charproof';
 
-// Recovers the AMK from the recovery phrase on a completely clean device
+// Recovers the AMK from the recovery phrase on a clean device (the account must
+// already exist remotely; this restores access to an existing account, it does
+// not bootstrap a new one).
 const { amk, amkId } = await recoverAmkWithPhrase(phrase);
 console.log(`AMK successfully recovered! ID: ${amkId}`);
 ```

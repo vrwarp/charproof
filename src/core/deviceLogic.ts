@@ -103,9 +103,9 @@ export async function prepareGenesisDocument(
   deviceId: string,
   deviceName: string,
   devicePubB64: string,
-  credentialId: string,
-  prfKey: AesGcmKey,
-  prfMethodId: string
+  credentialId?: string,
+  prfKey?: AesGcmKey,
+  prfMethodId?: string
 ): Promise<{ doc: AccountKeysDocument; rawAmk: ArrayBuffer }> {
   // Generate initial AMK (amk_v1)
   const amk = await generateSymmetricKey(256);
@@ -116,17 +116,35 @@ export async function prepareGenesisDocument(
   const devicePubKey = await importDevicePublicKey(devicePubB64);
   const wrappedAmk = await wrapAmk(devicePubKey, rawAmk.buffer as ArrayBuffer);
 
-  // Wrap for PRF
-  const amkB64 = btoa(String.fromCharCode(...new Uint8Array(rawAmk)));
-  const plainBytes = new TextEncoder().encode(amkB64) as PlaintextBytes;
-  const encryptedPrf = await getCrypto().encrypt(prfKey, plainBytes);
-  const wrappedForPrf = btoa(JSON.stringify({
-    ciphertext: uint8ToBase64(encryptedPrf.ciphertext),
-    iv: uint8ToBase64(encryptedPrf.iv)
-  }));
-
   const encryptedDevName = await encryptPayload(amk, deviceName);
-  const encryptedRecLabel = await encryptPayload(amk, `Passkey on ${deviceName}`);
+
+  // The device wrapping alone makes the account fully usable on this device.
+  // PRF is an OPTIONAL recovery custodian: when a PRF key is supplied we seal a
+  // second wrapping and register the recovery method; when it is not (e.g. the
+  // authenticator can't provision hmac-secret), genesis still completes as a
+  // device-key-only account and a recovery method can be sealed later via
+  // enablePrfRecovery()/setupPhraseRecovery().
+  const recoveryMethods: AccountKeysDocument["recoveryMethods"] = {};
+  const keyringForAmk: Record<string, string> = { [deviceId]: wrappedAmk };
+
+  if (prfKey && prfMethodId) {
+    const amkB64 = btoa(String.fromCharCode(...new Uint8Array(rawAmk)));
+    const plainBytes = new TextEncoder().encode(amkB64) as PlaintextBytes;
+    const encryptedPrf = await getCrypto().encrypt(prfKey, plainBytes);
+    const wrappedForPrf = btoa(JSON.stringify({
+      ciphertext: uint8ToBase64(encryptedPrf.ciphertext),
+      iv: uint8ToBase64(encryptedPrf.iv)
+    }));
+    const encryptedRecLabel = await encryptPayload(amk, `Passkey on ${deviceName}`);
+
+    recoveryMethods[prfMethodId] = {
+      type: 'prf',
+      encryptedLabel: encryptedRecLabel,
+      credentialId: credentialId ?? "default_prf",
+      createdAt: Date.now()
+    };
+    keyringForAmk[prfMethodId] = wrappedForPrf;
+  }
 
   const doc: AccountKeysDocument = {
     activeAmkId: amkId,
@@ -138,19 +156,9 @@ export async function prepareGenesisDocument(
         createdAt: Date.now()
       }
     },
-    recoveryMethods: {
-      [prfMethodId]: {
-        type: 'prf',
-        encryptedLabel: encryptedRecLabel,
-        credentialId: credentialId,
-        createdAt: Date.now()
-      }
-    },
+    recoveryMethods,
     keyring: {
-      [amkId]: {
-        [deviceId]: wrappedAmk,
-        [prfMethodId]: wrappedForPrf
-      }
+      [amkId]: keyringForAmk
     }
   };
 

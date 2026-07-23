@@ -31,6 +31,9 @@ import {
   wrapAmk,
   exportDevicePublicKey
 } from "../../core/crypto";
+import { prepareGenesisDocument } from "../deviceLogic";
+import { PrfUnavailableError } from "../../browser/WebAuthnPrfProvider";
+import type { PrfProvider } from "../interfaces";
 import * as bip39 from "bip39";
 import {
   DeterministicCryptoProvider,
@@ -505,5 +508,104 @@ describe("deviceService Integration Tests", () => {
     const recovered = await recoverAmkWithPhrase(mnemonic);
     const recoveredRaw = await getCrypto().exportSymmetricKey(recovered.amk);
     expect(new Uint8Array(recoveredRaw)).toEqual(new Uint8Array(expectedRaw));
+  });
+
+  test("prepareGenesisDocument without PRF args yields a device-key-only document", async () => {
+    const pair = await getCrypto().generateDeviceKeyPair();
+    const pub = await exportDevicePublicKey(pair.publicKey);
+
+    const { doc, rawAmk } = await prepareGenesisDocument("device-z", "Zed", pub);
+
+    expect(rawAmk.byteLength).toBe(32);
+    expect(doc.devices["device-z"]).toBeDefined();
+    // No recovery method registered, and the keyring holds ONLY the device wrap.
+    expect(Object.keys(doc.recoveryMethods)).toHaveLength(0);
+    expect(Object.keys(doc.keyring[doc.activeAmkId])).toEqual(["device-z"]);
+  });
+
+  test("Genesis degrades to a device-key-only account when PRF is unavailable", async () => {
+    class UnavailablePrfProvider implements PrfProvider {
+      async createCredential(): Promise<{ credentialId: string; prfResult: Uint8Array }> {
+        throw new PrfUnavailableError("preferred", []);
+      }
+      async getAssertion(): Promise<{ usedCredentialId: string; prfResult: Uint8Array }> {
+        throw new PrfUnavailableError("preferred", []);
+      }
+    }
+
+    setPrfProviders({ localDeviceStore, authProvider, prfProvider: new UnavailablePrfProvider() });
+    resetAllCaches();
+
+    // Genesis completes (does NOT throw) even though PRF cannot be provisioned.
+    const result = await getActiveAmk();
+    expect(result.amk).toBeDefined();
+    expect(result.amkId).toBe("amk_v1");
+
+    const doc = await accountKeyStore.getAccountKeys();
+    expect(doc).not.toBeNull();
+    // Device-key-only: no recovery methods, keyring holds only the device wrap.
+    expect(Object.keys(doc!.recoveryMethods)).toHaveLength(0);
+    expect(Object.keys(doc!.keyring[doc!.activeAmkId])).toEqual([localDeviceStore.getDeviceId()]);
+
+    // The recovery-less state is observable so the app can prompt the user.
+    const status = await getRecoveryStatus();
+    expect(status.isSealed).toBe(false);
+
+    // The account is usable locally: device keys were persisted.
+    expect(await localDeviceStore.loadDeviceKeys()).not.toBeNull();
+
+    // When PRF later becomes available, sealing recovery works and flips isSealed.
+    setPrfProviders({ localDeviceStore, authProvider, prfProvider });
+    clearPrfSessionCache();
+    await enablePrfRecovery();
+
+    const status2 = await getRecoveryStatus();
+    expect(status2.isSealed).toBe(true);
+    expect(status2.isCurrentPrfSealed).toBe(true);
+  });
+
+  test("An authenticator returning a too-short PRF degrades genesis instead of hard-blocking", async () => {
+    class ShortPrfProvider implements PrfProvider {
+      async createCredential(): Promise<{ credentialId: string; prfResult: Uint8Array }> {
+        // 16 bytes — a valid ceremony but too weak to protect a 256-bit AMK.
+        return { credentialId: "short-cred", prfResult: new Uint8Array(16).fill(1) };
+      }
+      async getAssertion(): Promise<{ usedCredentialId: string; prfResult: Uint8Array }> {
+        return { usedCredentialId: "short-cred", prfResult: new Uint8Array(16).fill(1) };
+      }
+    }
+
+    setPrfProviders({ localDeviceStore, authProvider, prfProvider: new ShortPrfProvider() });
+    resetAllCaches();
+
+    // Genesis must complete (device-key-only), NOT throw "PRF output too short".
+    const result = await getActiveAmk();
+    expect(result.amkId).toBe("amk_v1");
+
+    const doc = await accountKeyStore.getAccountKeys();
+    expect(Object.keys(doc!.recoveryMethods)).toHaveLength(0);
+    expect(Object.keys(doc!.keyring[doc!.activeAmkId])).toEqual([localDeviceStore.getDeviceId()]);
+  });
+
+  test("A user-cancelled passkey prompt aborts genesis instead of silently degrading", async () => {
+    class CancelledPrfProvider implements PrfProvider {
+      async createCredential(): Promise<{ credentialId: string; prfResult: Uint8Array }> {
+        const err = new Error("The operation either timed out or was not allowed.");
+        err.name = "NotAllowedError";
+        throw err;
+      }
+      async getAssertion(): Promise<{ usedCredentialId: string; prfResult: Uint8Array }> {
+        const err = new Error("The operation either timed out or was not allowed.");
+        err.name = "NotAllowedError";
+        throw err;
+      }
+    }
+
+    setPrfProviders({ localDeviceStore, authProvider, prfProvider: new CancelledPrfProvider() });
+    resetAllCaches();
+
+    // A cancellation must NOT create a weaker account behind the user's back.
+    await expect(getActiveAmk()).rejects.toThrow(/not allowed/i);
+    expect(await accountKeyStore.getAccountKeys()).toBeNull();
   });
 });
