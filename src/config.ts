@@ -3,6 +3,7 @@ import type { Auth } from "firebase/auth";
 import { setCryptoProvider } from "./core/crypto";
 import { WebCryptoProvider } from "./browser/WebCryptoProvider";
 import { setPrfProviders } from "./prfService";
+import { WebAuthnPrfProvider, type WebAuthnPrfOptions } from "./browser/WebAuthnPrfProvider";
 import type { CryptoProvider, PrfProvider } from "./core/interfaces";
 
 let db: Firestore | null = null;
@@ -21,6 +22,13 @@ export interface InitializeZKConfig {
   cryptoProvider?: CryptoProvider;
   /** Optional WebAuthn PRF provider override (testing only). */
   prfProvider?: PrfProvider;
+  /**
+   * Optional configuration for the built-in WebAuthn PRF provider — relying-party
+   * name/id, PRF salt, and userVerification. Ignored when a custom `prfProvider`
+   * instance is supplied. See {@link WebAuthnPrfOptions}; `prfSalt`, `rpId`, and
+   * `userVerification` are effectively set-once per deployment.
+   */
+  prf?: WebAuthnPrfOptions;
 }
 
 export function initializeZK(config: InitializeZKConfig) {
@@ -31,6 +39,8 @@ export function initializeZK(config: InitializeZKConfig) {
 
   if (config.prfProvider) {
     setPrfProviders({ prfProvider: config.prfProvider });
+  } else if (config.prf) {
+    setPrfProviders({ prfProvider: new WebAuthnPrfProvider(config.prf) });
   }
 }
 

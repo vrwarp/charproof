@@ -44,6 +44,18 @@ import { BrowserLocalDeviceStore } from "./browser/BrowserLocalDeviceStore";
 import { FirebaseAuthProvider } from "./browser/FirebaseAuthProvider";
 
 import { derivePrfMasterKey } from "./prfService";
+import { PrfUnavailableError } from "./browser/WebAuthnPrfProvider";
+
+/**
+ * True when an error indicates the authenticator genuinely cannot produce a PRF
+ * value (no hmac-secret) — as opposed to the user cancelling the prompt or a
+ * transient/network fault. Genesis degrades to a device-key-only account only
+ * on this signal; everything else propagates so we never silently create a
+ * weaker account behind the user's back.
+ */
+function isPrfUnavailable(e: any): boolean {
+  return e instanceof PrfUnavailableError || e?.name === "PrfUnavailableError";
+}
 
 let store: AccountKeyStore = new FirestoreAccountKeyStore();
 let local: LocalDeviceStore = new BrowserLocalDeviceStore();
@@ -353,10 +365,32 @@ async function setupGenesisDevice(uid: string): Promise<{ amk: AesGcmKey, amkId:
   }
 
   const deviceId = getDeviceId();
-  const { masterKey: prfKey } = await derivePrfMasterKey();
-  const prfMethodId = await getPrfMethodId(prfKey);
 
-  const credentialId = local.getPrfCredentialId(uid) || "default_prf";
+  // Attempt to bind a PRF recovery custodian at genesis. If the authenticator
+  // cannot provision PRF (e.g. no hmac-secret), degrade gracefully to a
+  // device-key-only account rather than blocking account creation entirely; a
+  // recovery method (passkey or phrase) can be sealed afterward via
+  // enablePrfRecovery()/setupPhraseRecovery(), and callers can detect the
+  // recovery-less state via getRecoveryStatus() (isSealed: false). A cancelled
+  // or errored prompt (anything other than PRF-unavailable) propagates so we
+  // don't silently create a weaker account.
+  let prfKey: AesGcmKey | undefined;
+  let prfMethodId: string | undefined;
+  let credentialId: string | undefined;
+  try {
+    const derived = await derivePrfMasterKey();
+    prfKey = derived.masterKey;
+    prfMethodId = await getPrfMethodId(prfKey);
+    credentialId = local.getPrfCredentialId(uid) || "default_prf";
+  } catch (e) {
+    if (!isPrfUnavailable(e)) throw e;
+    console.warn(
+      "[charproof] PRF is unavailable on this authenticator; creating a " +
+      "device-key-only account. Prompt the user to add a recovery method " +
+      "(passkey or phrase) as soon as possible.",
+      e
+    );
+  }
 
   const { doc, rawAmk } = await prepareGenesisDocument(
     deviceId,
